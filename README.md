@@ -7,7 +7,11 @@ TestCore sits between your test scripts and your lab instruments. It manages con
 Any engineer can connect with a terminal, type `PING`, get `+PONG`. Any language with a TCP socket can automate a full test sequence. No vendor SDK, no proprietary framework.
 
 ```
- Test Script (Python/C#/LabVIEW/...)
+┌──────────┐   ┌──────────┐  ┌──────────┐ 
+│ Client A │   │ Client B │  │ Client C │ Test Script (Python/C#/LabVIEW/...)
+└────┬─────┘   └────┬─────┘  └────┬─────┘
+     ▼              ▼             ▼
+     ┴──────────────┴─────────────┴
         │  RESP2 over TCP
         ▼
    ┌──────────┐
