@@ -23,57 +23,51 @@ testcore_cli.exe -p 6400                # custom port
 testcore_cli.exe -h 10.0.0.5 -p 6399   # both
 ```
 
+## Features
+
+- **TAB completion** — fetches command list from server at startup
+- **Inline hints** — shows argument syntax as you type
+- **MONITOR mode** — press any key to stop, auto-exits server-side mode
+- **SUBSCRIBE mode** — type UNSUBSCRIBE to exit
+- **Auto-reconnect** — reconnects on connection loss, retries on startup
+- **Prompt identity** — shows `testcore#N >` or `name#N >` after CLIENT NAME
+
 ## Example Session
 
 ```
-testcore-cli
-Type HELP for commands, EXIT to quit
-
-Connecting to 127.0.0.1:6399...
-Connected!
-
-127.0.0.1:6399> PING
+connected 127.0.0.1:6399
+testcore#1 > PING
 PONG
 
-127.0.0.1:6399> KSET temp "22.5"
+testcore#1 > CLIENT NAME bench-a
 OK
 
-127.0.0.1:6399> KGET temp
+bench-a#1 > KSET temp "22.5"
+OK
+
+bench-a#1 > KGET temp
 "22.5"
 
-127.0.0.1:6399> HELP
+bench-a#1 > IADD sim dryrun
+OK
 
-=== TestCore CLI ===
+bench-a#1 > MONITOR
+OK
+monitor mode — press any key to stop
+1711234567.123456 [bench-a#1] KSET temp 22.5
+monitor stopped
 
-Local Commands:
-  HELP      - Show this help message
-  HISTORY   - Show command history
-  CLEAR     - Clear the screen
-  EXIT/QUIT - Exit the CLI
-
-Server Commands:
-  CLIENT ID
-  CLIENT LIST
-  COMMAND LIST
-  IADD
-  IREAD
-  KGET
-  KSET
-  PING
-  ...
-
-127.0.0.1:6399> EXIT
-Bye!
+bench-a#1 > EXIT
 ```
 
 ## Local Commands
 
 | Command | Action |
 |---------|--------|
-| `HELP` | Query server for available commands |
-| `HISTORY` | Show command history (ring buffer, 100 entries) |
 | `CLEAR` | Clear the screen |
 | `EXIT` / `QUIT` | Disconnect and exit |
+
+All other input is sent to the server as-is (case preserved).
 
 ## RESP Display
 
@@ -89,7 +83,7 @@ Bye!
 ## Files
 
 ```
-src/cli/
+cli/
 ├── testcore_cli.c         # CLI source (AGPL-3.0)
 ├── build.bat              # Build script
 ├── README.md

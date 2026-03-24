@@ -224,11 +224,20 @@ class TestCore:
     # Instrument lifecycle (§6.3, §6.4)
     # ------------------------------------------------------------------
 
-    def iadd(self, name: str, driver: str, config: dict | None = None) -> bool:
-        """IADD name driver [config_json]. Returns True."""
+    def iadd(self, name: str, driver: str, address: str | None = None,
+             **kwargs) -> bool:
+        """IADD name driver [address] [key=value ...]. Returns True.
+
+        Example:
+            tc.iadd("awg", "agilent33500", "TCPIP0::192.168.1.50::inst0::INSTR")
+            tc.iadd("pm", "keysight_u2000", "COM3", baudrate=115200, timeout=10000)
+            tc.iadd("sim", "dryrun")
+        """
         args = ["IADD", name, driver]
-        if config:
-            args.append(json.dumps(config))
+        if address:
+            args.append(address)
+        for k, v in kwargs.items():
+            args.append(f"{k}={v}")
         r = self._cmd(*args)
         return r == "OK"
 
@@ -638,10 +647,13 @@ class Pipeline:
 
     # -- Instrument commands ---
 
-    def iadd(self, name: str, driver: str, config: dict | None = None) -> Pipeline:
+    def iadd(self, name: str, driver: str, address: str | None = None,
+             **kwargs) -> Pipeline:
         args = ["IADD", name, driver]
-        if config:
-            args.append(json.dumps(config))
+        if address:
+            args.append(address)
+        for k, v in kwargs.items():
+            args.append(f"{k}={v}")
         return self._queue(self._parse_ok, *args)
 
     def iremove(self, name: str) -> Pipeline:
