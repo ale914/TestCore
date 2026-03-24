@@ -12,15 +12,15 @@ It is not a SCPI gateway. TestCore does not know or care what protocol your inst
      │  IWRITE awg CH1:FREQ 1e9  │  SUBSCRIBE __event:kv    │  JOURNAL 20
      │                           │                          │
      ▼                           ▼                          ▼
-  ┌─────────────────────────────────────────────────────────────┐
-  │                      TestCore Server                        │
-  │                                                             │
-  │  ┌─────────┐  ┌──────────┐  ┌──────────┐  ┌────────────┐  │
-  │  │ Locking  │  │ KV Store │  │  Events  │  │  Journal   │  │
-  │  └─────────┘  └──────────┘  └──────────┘  └────────────┘  │
-  │                                                             │
+  ┌────────────────────────────────────────────────────────────┐
+  │                      TestCore Server                       │
+  │                                                            │
+  │  ┌─────────┐  ┌──────────┐  ┌──────────┐  ┌────────────┐   │
+  │  │ Locking │  │ KV Store │  │  Events  │  │  Journal   │   │
+  │  └─────────┘  └──────────┘  └──────────┘  └────────────┘   │
+  │                                                            │
   │  ┌─────────────────────────────────────────────────────┐   │
-  │  │              Instrument Registry                     │   │
+  │  │              Instrument Registry                    │   │
   │  │   awg: READY (owner: A)                             │   │
   │  │   psu: IDLE                                         │   │
   │  │   dmm: LOCKED (owner: A)                            │   │
