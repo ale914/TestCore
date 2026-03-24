@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "testcore"
+version = "0.9.0"
+description = "Command server for electronic test hardware"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.optional-dependencies]
+visa = [
+    "pyvisa>=1.13",
+    "pyvisa-py>=0.7",
+]
+serial = [
+    "pyserial>=3.5",
+]
+instruments = [
+    "pyvisa>=1.13",
+    "pyvisa-py>=0.7",
+    "pyserial>=3.5",
+]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-timeout>=2.1.0",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+timeout = 10
+
+[tool.setuptools.packages.find]
+where = ["."]
