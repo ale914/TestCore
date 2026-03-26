@@ -41,10 +41,10 @@ class BaseDriver(ABC):
         """
 
     @abstractmethod
-    def init(self) -> None:
-        """Full instrument initialization (reset to known state, self-test, etc.).
+    def init(self, selftest: bool = False) -> None:
+        """Full instrument initialization (reset to known state).
 
-        Called on INSTRUMENT.INIT (without config file).
+        Called on INSTRUMENT.INIT. Runs self-test only if selftest=True.
         Raise DriverError on failure.
         """
 
@@ -225,13 +225,14 @@ class ScpiDriver(BaseDriver):
         """Default: not supported. Override in drivers that support file saving."""
         raise DriverError("save not supported by this driver")
 
-    def init(self) -> None:
-        """Reset instrument and clear errors."""
+    def init(self, selftest: bool = False) -> None:
+        """Reset instrument and clear errors. Optionally run self-test."""
         self.rst()
         self.cls()
-        result = self.tst()
-        if result.strip() != "0":
-            raise DriverError(f"self-test failed: {result}")
+        if selftest:
+            result = self.tst()
+            if result.strip() != "0":
+                raise DriverError(f"self-test failed: {result}")
 
     def passthrough(self, command: str) -> str:
         """SCPI tunneling: send raw command, return response if query."""

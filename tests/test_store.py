@@ -203,4 +203,77 @@ class TestKeyValueStore:
         assert self.store.get('_sys:version') == '0.2.0'
         assert self.store.get('_drv:vsg:status') == 'OK'
 
+    # RO (read-only ownership) tests
+
+    def test_ro_set_and_protect(self):
+        """RO key can only be written by owner."""
+        self.store.set('k1', 'v1', ro=True, session_id=1)
+        assert self.store.get('k1') == 'v1'
+        # Owner can overwrite
+        self.store.set('k1', 'v2', ro=True, session_id=1)
+        assert self.store.get('k1') == 'v2'
+        # Other session cannot
+        with pytest.raises(ValueError, match="READONLY"):
+            self.store.set('k1', 'v3', session_id=2)
+
+    def test_ro_delete_by_owner(self):
+        """RO key can be deleted by owner."""
+        self.store.set('k1', 'v1', ro=True, session_id=1)
+        count = self.store.delete(['k1'], session_id=1)
+        assert count == 1
+
+    def test_ro_delete_by_other_rejected(self):
+        """RO key cannot be deleted by other session."""
+        self.store.set('k1', 'v1', ro=True, session_id=1)
+        with pytest.raises(ValueError, match="READONLY"):
+            self.store.delete(['k1'], session_id=2)
+
+    def test_ro_mset_blocked(self):
+        """MSET cannot overwrite RO key from different session."""
+        self.store.set('k1', 'v1', ro=True, session_id=1)
+        with pytest.raises(ValueError, match="READONLY"):
+            self.store.mset([('k1', 'v2')], session_id=2)
+
+    def test_ro_release_on_disconnect(self):
+        """release_owner removes RO flag, key becomes writable."""
+        self.store.set('k1', 'v1', ro=True, session_id=1)
+        self.store.release_owner(1)
+        # Now any session can write
+        self.store.set('k1', 'v2', session_id=2)
+        assert self.store.get('k1') == 'v2'
+
+    def test_ro_reclaim_after_release(self):
+        """After release, new session can reclaim key as RO."""
+        self.store.set('k1', 'v1', ro=True, session_id=1)
+        self.store.release_owner(1)
+        self.store.set('k1', 'v2', ro=True, session_id=2)
+        assert self.store.get('k1') == 'v2'
+        with pytest.raises(ValueError, match="READONLY"):
+            self.store.set('k1', 'v3', session_id=1)
+
+    def test_ro_owner_removes_protection(self):
+        """Owner re-setting without RO removes protection."""
+        self.store.set('k1', 'v1', ro=True, session_id=1)
+        self.store.set('k1', 'v2', session_id=1)  # no RO flag
+        # Now anyone can write
+        self.store.set('k1', 'v3', session_id=2)
+        assert self.store.get('k1') == 'v3'
+
+    def test_ro_flushdb_skips_other_ro(self):
+        """FLUSHDB skips RO keys owned by other sessions."""
+        self.store.set('k1', 'v1', ro=True, session_id=1)
+        self.store.set('k2', 'v2')
+        self.store.flushdb(session_id=2)
+        assert self.store.get('k1') == 'v1'  # protected, not flushed
+        assert self.store.get('k2') is None   # unprotected, flushed
+
+    def test_ro_flushdb_clears_own(self):
+        """FLUSHDB removes own RO keys."""
+        self.store.set('k1', 'v1', ro=True, session_id=1)
+        self.store.set('k2', 'v2')
+        self.store.flushdb(session_id=1)
+        assert self.store.get('k1') is None
+        assert self.store.get('k2') is None
+        assert len(self.store._owners) == 0
+
 

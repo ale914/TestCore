@@ -19,13 +19,13 @@ class TestCore:
     Usage:
         tc = TestCore()
         tc.ping()
-        tc.kset("meas:power", "23.4")
+        tc.kset("meas:power", 23.4)
         val = tc.kget("meas:power")
 
     Or as context manager:
         with TestCore(name="my_test") as tc:
             tc.ilock("vsg")
-            tc.iread("vsg:FREQ")
+            tc.iread("vsg", "FREQ")
     """
 
     def __init__(self, host: str = "127.0.0.1", port: int = 6399,
@@ -133,13 +133,21 @@ class TestCore:
     # Key-Value commands (§6.2)
     # ------------------------------------------------------------------
 
-    def kset(self, key: str, value, nx: bool = False, xx: bool = False) -> bool:
-        """KSET key value [NX|XX]. Returns True if set, False if condition failed."""
+    def kset(self, key: str, value: str | int | float,
+             nx: bool = False, xx: bool = False,
+             ro: bool = False) -> bool:
+        """KSET key value [NX|XX] [RO]. Returns True if set, False if condition failed.
+
+        RO marks the key as read-only for other clients. Only the creating
+        session can overwrite or delete it. Protection is released on disconnect.
+        """
         args = ["KSET", key, str(value)]
         if nx:
             args.append("NX")
         elif xx:
             args.append("XX")
+        if ro:
+            args.append("RO")
         r = self._cmd(*args)
         return r == "OK"
 
@@ -151,7 +159,8 @@ class TestCore:
         """KMGET key [key ...]. Returns list of values."""
         return self._cmd("KMGET", *keys)
 
-    def kmset(self, mapping: dict[str, Any] | None = None, **kwargs) -> bool:
+    def kmset(self, mapping: dict[str, str | int | float] | None = None,
+              **kwargs) -> bool:
         """KMSET key val [key val ...]. Accepts dict or kwargs."""
         pairs = mapping or kwargs
         args = ["KMSET"]
@@ -291,9 +300,9 @@ class TestCore:
         r = self._cmd("IUNLOCK", *instruments)
         return r == "OK"
 
-    def ilocks(self) -> dict[str, int]:
-        """ILOCKS. Returns dict {instrument: session_id}."""
-        r = self._cmd("ILOCKS")
+    def ilocked(self) -> dict[str, int]:
+        """ILOCKED. Returns dict {instrument: session_id}."""
+        r = self._cmd("ILOCKED")
         if not r:
             return {}
         # Response is array of "name:session:id" strings
@@ -310,11 +319,14 @@ class TestCore:
     # Init / Reset / Align (§6.4)
     # ------------------------------------------------------------------
 
-    def iinit(self, name: str, config_path: str | None = None) -> bool:
-        """IINIT name [config_path]. Initialize instrument. Returns True."""
+    def iinit(self, name: str, config_path: str | None = None,
+              selftest: bool = False) -> bool:
+        """IINIT name [config_path] [TST]. Initialize instrument. Returns True."""
         args = ["IINIT", name]
         if config_path:
             args.append(config_path)
+        if selftest:
+            args.append("TST")
         r = self._cmd(*args)
         return r == "OK"
 
@@ -332,20 +344,34 @@ class TestCore:
     # Read / Write / Raw / Load (§6.5)
     # ------------------------------------------------------------------
 
-    def iread(self, resource: str) -> str:
-        """IREAD instrument:resource. Returns value string."""
-        return self._cmd("IREAD", resource)
+    def iread(self, instrument: str, resource: str) -> str:
+        """IREAD instrument resource. Returns value string.
+
+        Example:
+            tc.iread("awg", "CH1:FREQ")
+        """
+        return self._cmd("IREAD", instrument, resource)
 
     def imread(self, *resources: str) -> list[str | None]:
-        """IMREAD resource [resource ...]. Returns list of values."""
+        """IMREAD instrument:resource [instrument:resource ...]. Returns list of values.
+
+        Example:
+            tc.imread("awg:CH1:FREQ", "psu:VOLT", "dmm:DC_VOLTAGE")
+        """
         r = self._cmd("IMREAD", *resources)
         if isinstance(r, list):
             return r
         return [r]
 
-    def iwrite(self, resource: str, value) -> bool:
-        """IWRITE instrument:resource value. Returns True."""
-        r = self._cmd("IWRITE", resource, str(value))
+    def iwrite(self, instrument: str, resource: str,
+               value: str | int | float) -> bool:
+        """IWRITE instrument resource value. Returns True.
+
+        Example:
+            tc.iwrite("awg", "CH1:FREQ", 1000000000)
+            tc.iwrite("psu", "VOLT", 3.3)
+        """
+        r = self._cmd("IWRITE", instrument, resource, str(value))
         return r == "OK"
 
     def iraw(self, instrument: str, scpi_command: str) -> str | None:
@@ -402,7 +428,7 @@ class TestCore:
         """AREAD alias. Read through alias. Returns value."""
         return self._cmd("AREAD", alias)
 
-    def awrite(self, alias: str, value) -> bool:
+    def awrite(self, alias: str, value: str | int | float) -> bool:
         """AWRITE alias value. Write through SUB alias. Returns True."""
         r = self._cmd("AWRITE", alias, str(value))
         return r == "OK"
@@ -599,12 +625,16 @@ class Pipeline:
 
     # -- KV commands ---
 
-    def kset(self, key: str, value, nx: bool = False, xx: bool = False) -> Pipeline:
+    def kset(self, key: str, value: str | int | float,
+             nx: bool = False, xx: bool = False,
+             ro: bool = False) -> Pipeline:
         args = ["KSET", key, str(value)]
         if nx:
             args.append("NX")
         elif xx:
             args.append("XX")
+        if ro:
+            args.append("RO")
         return self._queue(self._parse_ok, *args)
 
     def kget(self, key: str) -> Pipeline:
@@ -613,7 +643,8 @@ class Pipeline:
     def kmget(self, *keys: str) -> Pipeline:
         return self._queue(self._parse_identity, "KMGET", *keys)
 
-    def kmset(self, mapping: dict[str, Any] | None = None, **kwargs) -> Pipeline:
+    def kmset(self, mapping: dict[str, str | int | float] | None = None,
+              **kwargs) -> Pipeline:
         pairs = mapping or kwargs
         args = ["KMSET"]
         for k, v in pairs.items():
@@ -668,19 +699,26 @@ class Pipeline:
     def iunlock(self, *instruments: str) -> Pipeline:
         return self._queue(self._parse_ok, "IUNLOCK", *instruments)
 
-    def iinit(self, name: str) -> Pipeline:
-        return self._queue(self._parse_ok, "IINIT", name)
+    def iinit(self, name: str, config_path: str | None = None,
+              selftest: bool = False) -> Pipeline:
+        args = ["IINIT", name]
+        if config_path:
+            args.append(config_path)
+        if selftest:
+            args.append("TST")
+        return self._queue(self._parse_ok, *args)
 
-    def iread(self, resource: str) -> Pipeline:
-        return self._queue(self._parse_identity, "IREAD", resource)
+    def iread(self, instrument: str, resource: str) -> Pipeline:
+        return self._queue(self._parse_identity, "IREAD", instrument, resource)
 
     def imread(self, *resources: str) -> Pipeline:
         def parse(r):
             return r if isinstance(r, list) else [r]
         return self._queue(parse, "IMREAD", *resources)
 
-    def iwrite(self, resource: str, value) -> Pipeline:
-        return self._queue(self._parse_ok, "IWRITE", resource, str(value))
+    def iwrite(self, instrument: str, resource: str,
+               value: str | int | float) -> Pipeline:
+        return self._queue(self._parse_ok, "IWRITE", instrument, resource, str(value))
 
     def iraw(self, instrument: str, scpi_command: str) -> Pipeline:
         return self._queue(
@@ -701,5 +739,5 @@ class Pipeline:
     def aread(self, alias: str) -> Pipeline:
         return self._queue(self._parse_identity, "AREAD", alias)
 
-    def awrite(self, alias: str, value) -> Pipeline:
+    def awrite(self, alias: str, value: str | int | float) -> Pipeline:
         return self._queue(self._parse_ok, "AWRITE", alias, str(value))

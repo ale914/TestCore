@@ -26,6 +26,7 @@ def reset_state():
     """Reset store, registry, event bus, and aliases before each test."""
     store = get_store()
     store._data.clear()
+    store._owners.clear()
     registry = get_registry()
     for name in list(registry._instruments.keys()):
         try:
@@ -603,7 +604,7 @@ class TestInstrumentLifecycle:
     async def test_ilocks_empty_then_populated(self, server):
         c = await Client.connect(server.test_port)
         try:
-            await c.send(["ILOCKS"])
+            await c.send(["ILOCKED"])
             resp = await c.read()
             assert isinstance(resp, list)
             assert len(resp) == 0
@@ -613,7 +614,7 @@ class TestInstrumentLifecycle:
             await c.send(["ILOCK", "scope"])
             await c.read()
 
-            await c.send(["ILOCKS"])
+            await c.send(["ILOCKED"])
             resp = await c.read()
             assert isinstance(resp, list)
             assert len(resp) == 1
@@ -1710,3 +1711,133 @@ class TestAliasIntegration:
             assert "NOALIAS" in resp
         finally:
             await c.close()
+
+
+class TestKVReadOnly:
+    """End-to-end tests for KSET RO with multiple clients."""
+
+    @pytest.mark.asyncio
+    async def test_ro_blocks_other_client(self, server):
+        """Client A sets RO key, client B cannot overwrite it."""
+        a = await Client.connect(server.test_port)
+        b = await Client.connect(server.test_port)
+        try:
+            # Client A sets key with RO
+            await a.send(["KSET", "meas:freq", "1000", "RO"])
+            resp = await a.read()
+            assert resp == "OK"
+
+            # Client B tries to overwrite → error
+            await b.send(["KSET", "meas:freq", "2000"])
+            resp = await b.read()
+            assert "READONLY" in resp
+
+            # Client B can still read
+            await b.send(["KGET", "meas:freq"])
+            resp = await b.read()
+            assert resp == "1000"
+        finally:
+            await a.close()
+            await b.close()
+
+    @pytest.mark.asyncio
+    async def test_ro_owner_can_overwrite(self, server):
+        """Owner can overwrite own RO key."""
+        a = await Client.connect(server.test_port)
+        try:
+            await a.send(["KSET", "k1", "v1", "RO"])
+            resp = await a.read()
+            assert resp == "OK"
+
+            await a.send(["KSET", "k1", "v2", "RO"])
+            resp = await a.read()
+            assert resp == "OK"
+
+            await a.send(["KGET", "k1"])
+            resp = await a.read()
+            assert resp == "v2"
+        finally:
+            await a.close()
+
+    @pytest.mark.asyncio
+    async def test_ro_delete_blocked(self, server):
+        """Client B cannot KDEL a key owned RO by client A."""
+        a = await Client.connect(server.test_port)
+        b = await Client.connect(server.test_port)
+        try:
+            await a.send(["KSET", "k1", "v1", "RO"])
+            await a.read()
+
+            await b.send(["KDEL", "k1"])
+            resp = await b.read()
+            assert "READONLY" in resp
+        finally:
+            await a.close()
+            await b.close()
+
+    @pytest.mark.asyncio
+    async def test_ro_released_on_disconnect(self, server):
+        """After client A disconnects, RO key becomes writable."""
+        a = await Client.connect(server.test_port)
+        b = await Client.connect(server.test_port)
+        try:
+            await a.send(["KSET", "k1", "v1", "RO"])
+            await a.read()
+
+            # Close A → RO released
+            await a.close()
+            await asyncio.sleep(0.1)
+
+            # Now B can overwrite
+            await b.send(["KSET", "k1", "v2"])
+            resp = await b.read()
+            assert resp == "OK"
+
+            await b.send(["KGET", "k1"])
+            resp = await b.read()
+            assert resp == "v2"
+        finally:
+            await b.close()
+
+    @pytest.mark.asyncio
+    async def test_ro_kflush_skips_other_ro(self, server):
+        """KFLUSH from client B does not remove client A's RO keys."""
+        a = await Client.connect(server.test_port)
+        b = await Client.connect(server.test_port)
+        try:
+            await a.send(["KSET", "protected", "yes", "RO"])
+            await a.read()
+
+            await b.send(["KSET", "normal", "val"])
+            await b.read()
+
+            # B flushes — should skip A's RO key
+            await b.send(["KFLUSH"])
+            await b.read()
+
+            await a.send(["KGET", "protected"])
+            resp = await a.read()
+            assert resp == "yes"
+
+            await a.send(["KGET", "normal"])
+            resp = await a.read()
+            assert resp is None
+        finally:
+            await a.close()
+            await b.close()
+
+    @pytest.mark.asyncio
+    async def test_ro_kmset_blocked(self, server):
+        """KMSET cannot overwrite RO key from different client."""
+        a = await Client.connect(server.test_port)
+        b = await Client.connect(server.test_port)
+        try:
+            await a.send(["KSET", "k1", "v1", "RO"])
+            await a.read()
+
+            await b.send(["KMSET", "k1", "new", "k2", "val"])
+            resp = await b.read()
+            assert "READONLY" in resp
+        finally:
+            await a.close()
+            await b.close()

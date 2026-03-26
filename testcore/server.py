@@ -176,6 +176,15 @@ class ClientHandler:
         except Exception as e:
             logger.error(f"Client {self.client_id} disconnect cleanup error: {e}")
 
+        # Release RO keys owned by this session
+        try:
+            from .store import get_store
+            get_store().release_owner(self.client_id)
+        except Exception as e:
+            logger.error(
+                f"Client {self.client_id} disconnect: "
+                f"failed to release RO keys: {e}")
+
         # Publish session disconnect event (spec §9.1)
         try:
             from .events import publish_session_event

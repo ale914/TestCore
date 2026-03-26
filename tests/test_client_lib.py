@@ -237,7 +237,7 @@ class TestInstrumentCommands:
     def test_lock_unlock(self, tc):
         tc.iadd("inst1", "dryrun")
         assert tc.ilock("inst1") is True
-        locks = tc.ilocks()
+        locks = tc.ilocked()
         assert "inst1" in locks
         assert tc.iunlock("inst1") is True
 
@@ -250,8 +250,8 @@ class TestInstrumentCommands:
         tc.iadd("gen", "dryrun")
         tc.ilock("gen")
         tc.iinit("gen")
-        assert tc.iwrite("gen:FREQ", "1e6") is True
-        val = tc.iread("gen:FREQ")
+        assert tc.iwrite("gen", "FREQ", "1e6") is True
+        val = tc.iread("gen", "FREQ")
         assert val is not None
 
     def test_imread(self, tc):
@@ -285,7 +285,7 @@ class TestInstrumentCommands:
         tc.iadd("sv2", "dryrun")
         tc.ilock("sv2")
         tc.iinit("sv2")
-        tc.iwrite("sv2:FREQ", "1e6")
+        tc.iwrite("sv2", "FREQ", "1e6")
         out_file = str(tmp_path / "data.csv")
         result = tc.isave("sv2", "DATA", out_file)
         assert "rows saved" in result
@@ -316,7 +316,7 @@ class TestInstrumentCommands:
     def test_idle_error(self, tc):
         tc.iadd("idle1", "dryrun")
         with pytest.raises(IdleError):
-            tc.iread("idle1:FREQ")
+            tc.iread("idle1", "FREQ")
 
     def test_locked_error(self, server_port):
         tc1 = TestCore(host="127.0.0.1", port=server_port)
@@ -332,7 +332,7 @@ class TestInstrumentCommands:
         tc.iadd("ni1", "dryrun")
         tc.ilock("ni1")
         with pytest.raises(NotInitError):
-            tc.iread("ni1:FREQ")
+            tc.iread("ni1", "FREQ")
 
     def test_driver_list(self, tc):
         tc.iadd("drv1", "dryrun")
@@ -505,11 +505,11 @@ class TestWorkflow:
         tc.iinit("meas")
 
         # Configure
-        tc.iwrite("gen:FREQ", "900e6")
-        tc.iwrite("gen:VOUT", "1.5")
+        tc.iwrite("gen", "FREQ", "900e6")
+        tc.iwrite("gen", "VOUT", "1.5")
 
         # Read measurement
-        reading = tc.iread("meas:CH1")
+        reading = tc.iread("meas", "CH1")
         assert reading is not None
 
         # Store result
@@ -648,9 +648,9 @@ class TestPipeline:
 
         # Read/write via pipeline
         with tc.pipeline() as pipe:
-            pipe.iwrite("pgen:FREQ", "1e6")
-            pipe.iwrite("pgen:VOUT", "2.0")
-            pipe.iread("pgen:FREQ")
+            pipe.iwrite("pgen", "FREQ", "1e6")
+            pipe.iwrite("pgen", "VOUT", "2.0")
+            pipe.iread("pgen", "FREQ")
             results = pipe.execute()
 
         assert results[0] is True

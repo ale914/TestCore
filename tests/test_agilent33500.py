@@ -92,9 +92,16 @@ class TestScpiDriver:
         d, _ = self._make()
         assert "No error" in d.error()
 
-    def test_init_calls_rst_cls_tst(self):
+    def test_init_calls_rst_cls(self):
         d, t = self._make()
         d.init()
+        assert "*RST" in t.sent
+        assert "*CLS" in t.sent
+        assert "*TST?" not in t.queries
+
+    def test_init_with_selftest(self):
+        d, t = self._make()
+        d.init(selftest=True)
         assert "*RST" in t.sent
         assert "*CLS" in t.sent
         assert "*TST?" in t.queries
@@ -102,7 +109,7 @@ class TestScpiDriver:
     def test_init_fails_on_bad_selftest(self):
         d, _ = self._make({"*TST?": "1"})
         with pytest.raises(DriverError, match="self-test failed"):
-            d.init()
+            d.init(selftest=True)
 
     def test_passthrough_query(self):
         d, _ = self._make({"MEAS:FREQ?": "1000.0"})

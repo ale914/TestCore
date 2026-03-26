@@ -61,11 +61,20 @@ class TestGenericScpiConnect:
 
 class TestGenericScpiInit:
 
-    def test_init_runs_rst_cls_tst(self):
+    def test_init_runs_rst_cls(self):
         t = MockTransport()
         d = GenericScpiDriver()
         d.connect(make_config(transport_obj=t))
         d.init()
+        assert "*RST" in t.sent
+        assert "*CLS" in t.sent
+        assert "*TST?" not in t.queries
+
+    def test_init_with_selftest(self):
+        t = MockTransport()
+        d = GenericScpiDriver()
+        d.connect(make_config(transport_obj=t))
+        d.init(selftest=True)
         assert "*RST" in t.sent
         assert "*CLS" in t.sent
         assert "*TST?" in t.queries
@@ -75,7 +84,7 @@ class TestGenericScpiInit:
         d = GenericScpiDriver()
         d.connect(make_config(transport_obj=t))
         with pytest.raises(DriverError, match="self-test failed"):
-            d.init()
+            d.init(selftest=True)
 
 
 class TestGenericScpiDiscover:

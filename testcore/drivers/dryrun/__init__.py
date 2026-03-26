@@ -24,7 +24,7 @@ class DryRunDriver(BaseDriver):
     def disconnect(self):
         self._state.clear()
 
-    def init(self):
+    def init(self, selftest=False):
         for r in self._state:
             self._state[r] = "0.0"
 

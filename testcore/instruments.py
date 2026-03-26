@@ -235,7 +235,8 @@ class InstrumentRegistry:
                 f"driver timeout ({t}s) → UNRESPONSIVE")
 
     async def init_instrument(self, name: str,
-                              config_path: str | None = None) -> None:
+                              config_path: str | None = None,
+                              selftest: bool = False) -> None:
         """Full init (INSTRUMENT.INIT). Requires LOCKED or READY state."""
         inst = self._get(name)
         if inst.state == InstrumentState.IDLE:
@@ -245,7 +246,7 @@ class InstrumentRegistry:
         if config_path:
             await self._call_driver(inst, inst.driver.configure, config_path,
                                     timeout=self._slow_timeout)
-        await self._call_driver(inst, inst.driver.init,
+        await self._call_driver(inst, inst.driver.init, selftest,
                                 timeout=self._slow_timeout)
         resources = await self._call_driver(inst, inst.driver.discover)
         inst.resources = resources

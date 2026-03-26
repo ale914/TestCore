@@ -13,19 +13,19 @@ IINIT sim
 ## Read / Write Resources
 
 ```
-IREAD sim:VOUT
+IREAD sim VOUT
 "0.0"
 
-IWRITE sim:VOUT 3.3
+IWRITE sim VOUT 3.3
 OK
 
-IREAD sim:VOUT
+IREAD sim VOUT
 "3.3"
 
-IWRITE sim:FREQ 1000
+IWRITE sim FREQ 1000
 OK
 
-IREAD sim:FREQ
+IREAD sim FREQ
 "1000"
 ```
 
@@ -114,9 +114,9 @@ testcore#1 > IRESOURCES sim
 2) "CH2"
 3) "FREQ"
 4) "VOUT"
-testcore#1 > IWRITE sim:VOUT 5.0
+testcore#1 > IWRITE sim VOUT 5.0
 OK
-testcore#1 > IREAD sim:VOUT
+testcore#1 > IREAD sim VOUT
 "5.0"
 testcore#1 > KSET meas:voltage 5.0
 OK

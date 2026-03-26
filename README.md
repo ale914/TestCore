@@ -153,21 +153,22 @@ from testcore_client import TestCore
 
 tc = TestCore()
 tc.ping()                                    # True
-tc.kset("freq", "1000")                      # True
+tc.kset("freq", 1000)                        # True
+tc.kset("meas:ref", -42.3, ro=True)          # True (read-only for other clients)
 tc.kget("freq")                              # "1000"
 
 # Instrument workflow
-tc.iadd("awg", "drivers/agilent33500")
+tc.iadd("awg", "agilent33500", "TCPIP0::192.168.1.50::inst0::INSTR")
 tc.ilock("awg")
 tc.iinit("awg")
-tc.iwrite("awg", "CH1:FREQ", "1000")
+tc.iwrite("awg", "CH1:FREQ", 1000)
 tc.iread("awg", "CH1:FREQ")                  # "1000.0"
 tc.iunlock("awg")
 
 # Pipeline (batch commands, single round-trip)
 with tc.pipeline() as pipe:
-    pipe.iwrite("awg", "CH1:FREQ", "900e6")
-    pipe.iwrite("awg", "CH1:AMPL", "2.5")
+    pipe.iwrite("awg", "CH1:FREQ", 900000000)
+    pipe.iwrite("awg", "CH1:AMPL", 2.5)
     pipe.iwrite("awg", "CH1:OUTPUT", "ON")
     results = pipe.execute()
 
@@ -193,7 +194,7 @@ tc.close()
 |---------------------|------------------|--------------------------------------------------------------------------------|
 | Network Layer       | `server.py`      | Accept TCP connections, parse/serialize RESP2, feed commands to the event loop  |
 | Protocol            | `protocol.py`    | RESP2 parser/serializer (all 5 types + inline commands)                         |
-| Key-Value Store     | `store.py`       | In-memory dict for KSET/KGET/KDEL. Reserved key prefixes                       |
+| Key-Value Store     | `store.py`       | In-memory dict for KSET/KGET/KDEL. Reserved prefixes, per-key RO ownership     |
 | Instrument Manager  | `instruments.py` | Instrument registry, state machine, route commands to driver instances          |
 | Command Registry    | `commands.py`    | Dispatch table: command name → handler function. All built-in commands          |
 | Event System        | `events.py`      | Server-side pub/sub for instrument, lock, KV, and session events               |
@@ -312,6 +313,8 @@ The store is a Python `dict`. Keys and values are strings. Identical to Redis st
 | `_lock:` | Resource lock state                                      |
 
 Client keys must not start with `_`. KSET on a `_` key returns `-READONLY`. KGET on reserved keys is allowed and is the primary introspection mechanism.
+
+Client keys can be marked read-only with `KSET key value RO`. Only the creating session can modify or delete them. Other clients get `-READONLY`. Protection is released automatically on disconnect. See KSET command reference for details.
 
 ### Event System
 
@@ -432,11 +435,12 @@ Unsubscribes from channels. Without arguments, unsubscribes from all.
 
 ### Key-Value Commands
 
-#### KSET key value [NX|XX]
-Sets a key. `NX`: only if not exists. `XX`: only if exists. Returns `OK` or nil.
+#### KSET key value [NX|XX] [RO]
+Sets a key. `NX`: only if not exists. `XX`: only if exists. `RO`: read-only for other clients — only the session that set the key can overwrite or delete it. Protection is released when the owning client disconnects. Returns `OK` or nil.
 ```
 KSET meas:freq 900e6           →  +OK
 KSET meas:freq 900e6 NX        →  $-1  (already exists)
+KSET meas:freq 900e6 RO        →  +OK  (protected from other clients)
 ```
 
 #### KGET key
@@ -495,11 +499,12 @@ IADD sim  dryrun                                              →  +OK
 #### IREMOVE name
 Calls `safe_state()`, `disconnect()`. Releases any lock. Removes from registry.
 
-#### IINIT name [config_file_path]
-**Requires `LOCKED` or `READY`.** Full instrument initialization. Optional config file (driver-proprietary format). Calls `init()`, then `discover()` to populate resources. State → `READY`.
+#### IINIT name [config_file_path] [TST]
+**Requires `LOCKED` or `READY`.** Full instrument initialization: `*RST` + `*CLS`. Optional config file (driver-proprietary format). Optional `TST` flag runs `*TST?` self-test. Calls `init()`, then `discover()` to populate resources. State → `READY`.
 ```
 IINIT awg                          →  +OK
 IINIT awg ./configs/awg_setup.cfg  →  +OK
+IINIT awg TST                      →  +OK  (with self-test)
 ```
 
 #### IINFO name
@@ -522,20 +527,18 @@ Returns array of registered driver module names.
 
 ### Resource Access Commands
 
-Resource address format: `instrument:resource` (e.g., `awg:CH1:FREQ`, `psu:VOLTAGE`).
-
-#### IREAD resource
+#### IREAD instrument resource
 Reads current value from hardware. **Requires lock + READY.**
 ```
-IREAD awg:CH1:FREQ     →  "1000000.0"
-IREAD psu:VOLTAGE       →  "3.300"
+IREAD awg CH1:FREQ     →  "1000000.0"
+IREAD psu VOLTAGE       →  "3.300"
 ```
 
-#### IWRITE resource value
+#### IWRITE instrument resource value
 Writes a value. **Requires lock + READY.**
 ```
-IWRITE awg:CH1:FREQ 900e6    →  +OK
-IWRITE psu:VOLTAGE 3.3       →  +OK
+IWRITE awg CH1:FREQ 900e6    →  +OK
+IWRITE psu VOLTAGE 3.3       →  +OK
 ```
 
 #### IRAW instrument command_string
@@ -575,7 +578,7 @@ Releases locks. Calls `safe_state()` on each. State → `IDLE`. Only the owner c
 #### IUNLOCK ALL
 Releases all locks held by the current session.
 
-#### ILOCKS
+#### ILOCKED
 Returns all currently held locks with instrument name and owning session.
 
 ### Alias Commands
@@ -620,7 +623,7 @@ All errors are RESP error strings with a class prefix:
 | `DRIVER`     | Error from driver (DriverError message follows)                    |
 | `TIMEOUT`    | Driver call exceeded watchdog timeout                              |
 | `FAULT`      | Instrument is UNRESPONSIVE/FAULT, requires IRESET                  |
-| `READONLY`   | Attempt to KSET a reserved key prefix                              |
+| `READONLY`   | Reserved key prefix, or key is RO and owned by another session     |
 | `NORESOURCE` | Instrument or resource does not exist                              |
 | `NOALIAS`    | Alias does not exist                                               |
 | `WRONGTYPE`  | Operation against wrong value type (e.g., KINCR on non-numeric)    |
@@ -672,8 +675,8 @@ class MyInstrumentDriver(BaseDriver):
     def disconnect(self) -> None:
         """Close connection. Called on IREMOVE / shutdown. Must not raise."""
 
-    def init(self) -> None:
-        """Full instrument reset and self-test. Called on IINIT."""
+    def init(self, selftest: bool = False) -> None:
+        """Reset instrument (*RST + *CLS). Self-test (*TST?) if requested. Called on IINIT."""
 
     def configure(self, config_path: str) -> None:
         """Apply proprietary config file. Called on IINIT with path."""
@@ -722,7 +725,7 @@ For SCPI instruments, `ScpiDriver` provides a base class with built-in `*RST`, `
 ### Driver Lifecycle Sequence
 
 1. **IADD** (thin init): Import module → instantiate → open transport → `connect(config)` → state `IDLE`
-2. **IINIT** (full init): `configure(path)` if provided → `init()` → `discover()` → state `READY`
+2. **IINIT** (full init): `configure(path)` if provided → `init(selftest)` → `discover()` → state `READY`
 3. **IALIGN** (accept state): `discover()` only → state `READY` (no reset/re-init)
 4. **IUNLOCK** / disconnect: `safe_state()` → state `IDLE`
 5. **IREMOVE**: `safe_state()` → `disconnect()` → removed

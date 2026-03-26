@@ -191,14 +191,17 @@ async def handle_set(args: list[str], context: dict = None) -> bytes:
         return RESPSerializer.error("wrong number of arguments for 'KSET' command")
 
     key, value = args[0], args[1]
-    nx = len(args) > 2 and args[2].upper() == 'NX'
-    xx = len(args) > 2 and args[2].upper() == 'XX'
+    flags = {a.upper() for a in args[2:]}
+    nx = 'NX' in flags
+    xx = 'XX' in flags
+    ro = 'RO' in flags
 
+    session_id = (context or {}).get("session_id")
     store = get_store()
     try:
-        success = store.set(key, value, nx=nx, xx=xx)
+        success = store.set(key, value, nx=nx, xx=xx, ro=ro,
+                            session_id=session_id)
         if success:
-            session_id = (context or {}).get("session_id")
             await publish_kv_event(key, value, session_id)
             return _OK_RESPONSE
         return RESPSerializer.null()
@@ -250,9 +253,10 @@ async def handle_mset(args: list[str], context: dict = None) -> bytes:
     # Parse key-value pairs
     pairs = [(args[i], args[i+1]) for i in range(0, len(args), 2)]
 
+    session_id = (context or {}).get("session_id")
     store = get_store()
     try:
-        store.mset(pairs)
+        store.mset(pairs, session_id=session_id)
         return RESPSerializer.simple_string("OK")
     except ValueError as e:
         return RESPSerializer.error(str(e))
@@ -267,9 +271,10 @@ async def handle_del(args: list[str], context: dict = None) -> bytes:
     if len(args) < 1:
         return RESPSerializer.error("wrong number of arguments for 'KDEL' command")
 
+    session_id = (context or {}).get("session_id")
     store = get_store()
     try:
-        count = store.delete(args)
+        count = store.delete(args, session_id=session_id)
         return RESPSerializer.integer(count)
     except ValueError as e:
         return RESPSerializer.error(str(e))
@@ -320,8 +325,9 @@ async def handle_flushdb(args: list[str], context: dict = None) -> bytes:
 
     FLUSHDB  → +OK\r\n
     """
+    session_id = (context or {}).get("session_id")
     store = get_store()
-    store.flushdb()
+    store.flushdb(session_id=session_id)
     return RESPSerializer.simple_string("OK")
 
 
@@ -387,17 +393,23 @@ async def handle_instrument_remove(args: list[str], context: dict = None) -> byt
 
 
 async def handle_instrument_init(args: list[str], context: dict = None) -> bytes:
-    """Handle INSTRUMENT.INIT name [config_file_path]."""
+    """Handle INSTRUMENT.INIT name [config_file_path] [TST]."""
     if len(args) < 1:
         return RESPSerializer.error(
             "wrong number of arguments for 'IINIT' command")
 
     name = args[0]
-    config_path = args[1] if len(args) > 1 else None
+    config_path = None
+    selftest = False
+    for arg in args[1:]:
+        if arg.upper() == "TST":
+            selftest = True
+        elif config_path is None:
+            config_path = arg
 
     registry = get_registry()
     try:
-        await registry.init_instrument(name, config_path)
+        await registry.init_instrument(name, config_path, selftest=selftest)
         await publish_instrument_event("INIT", name)
         return RESPSerializer.simple_string("OK")
     except (IdleError, NotInitError, FaultError, DriverError) as e:
@@ -617,7 +629,7 @@ async def handle_locks(args: list[str], context: dict = None) -> bytes:
 # Resource Command Handlers (spec §6.4)
 
 async def handle_read(args: list[str], context: dict = None) -> bytes:
-    """Handle READ instrument:resource."""
+    """Handle READ instrument:resource or READ instrument resource."""
     if len(args) < 1:
         return RESPSerializer.error(
             "wrong number of arguments for 'IREAD' command")
@@ -626,10 +638,17 @@ async def handle_read(args: list[str], context: dict = None) -> bytes:
     if session_id is None:
         return RESPSerializer.error("no session context")
 
-    try:
-        inst_name, resource = _parse_resource_address(args[0])
-    except ValueError as e:
-        return RESPSerializer.error(str(e))
+    # Accept both "instrument:resource" and "instrument resource"
+    if ":" in args[0]:
+        try:
+            inst_name, resource = _parse_resource_address(args[0])
+        except ValueError as e:
+            return RESPSerializer.error(str(e))
+    elif len(args) >= 2:
+        inst_name, resource = args[0], args[1]
+    else:
+        return RESPSerializer.error(
+            "wrong number of arguments for 'IREAD' command")
 
     registry = get_registry()
     try:
@@ -645,7 +664,7 @@ async def handle_read(args: list[str], context: dict = None) -> bytes:
 
 
 async def handle_write(args: list[str], context: dict = None) -> bytes:
-    """Handle WRITE instrument:resource value."""
+    """Handle WRITE instrument:resource value or WRITE instrument resource value."""
     if len(args) < 2:
         return RESPSerializer.error(
             "wrong number of arguments for 'IWRITE' command")
@@ -654,10 +673,18 @@ async def handle_write(args: list[str], context: dict = None) -> bytes:
     if session_id is None:
         return RESPSerializer.error("no session context")
 
-    try:
-        inst_name, resource = _parse_resource_address(args[0])
-    except ValueError as e:
-        return RESPSerializer.error(str(e))
+    # Accept both "instrument:resource value" and "instrument resource value"
+    if ":" in args[0]:
+        try:
+            inst_name, resource = _parse_resource_address(args[0])
+        except ValueError as e:
+            return RESPSerializer.error(str(e))
+        value = args[1]
+    elif len(args) >= 3:
+        inst_name, resource, value = args[0], args[1], args[2]
+    else:
+        return RESPSerializer.error(
+            "wrong number of arguments for 'IWRITE' command")
 
     registry = get_registry()
     try:
@@ -666,7 +693,7 @@ async def handle_write(args: list[str], context: dict = None) -> bytes:
             if inst.lock_owner is None:
                 raise IdleError(f"{inst_name} not locked")
             raise LockedError(f"{inst_name} owned by session {inst.lock_owner}")
-        await registry.write(inst_name, resource, args[1])
+        await registry.write(inst_name, resource, value)
         return RESPSerializer.simple_string("OK")
     except (IdleError, NotInitError, LockedError, FaultError, DriverError) as e:
         return _state_error(e)
@@ -1442,7 +1469,7 @@ dispatcher.register("DRIVER LIST", handle_driver_list)
 # Register lock commands (spec §6.5) — I prefix
 dispatcher.register("ILOCK", handle_lock)
 dispatcher.register("IUNLOCK", handle_unlock)
-dispatcher.register("ILOCKS", handle_locks)
+dispatcher.register("ILOCKED", handle_locks)
 
 # Register resource commands (spec §6.4) — I prefix
 dispatcher.register("IREAD", handle_read)

@@ -2,9 +2,9 @@
 # Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0)
 # See LICENSE file for details.
 
-"""TestCore - Redis-inspired command server for test hardware."""
+"""TestCore - Command server for test hardware."""
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 
 from .base_driver import BaseDriver, ScpiDriver, DriverError
 

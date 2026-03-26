@@ -58,9 +58,9 @@ class Agilent33500Driver(ScpiDriver):
         if "33522" in idn:
             self._channels = 2
 
-    def init(self) -> None:
-        """Reset to factory defaults, clear errors, run self-test."""
-        super().init()
+    def init(self, selftest: bool = False) -> None:
+        """Reset to factory defaults, clear errors. Self-test if requested."""
+        super().init(selftest)
         self._send("OUTP1 OFF")
         if self._channels == 2:
             self._send("OUTP2 OFF")

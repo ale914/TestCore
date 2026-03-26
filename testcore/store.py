@@ -24,15 +24,25 @@ class KeyValueStore:
 
     def __init__(self) -> None:
         self._data: dict[str, str] = {}
+        self._owners: dict[str, int] = {}  # key → session_id (RO keys only)
 
     def _is_reserved(self, key: str) -> bool:
         """Check if key uses reserved prefix."""
         return key.startswith(RESERVED_PREFIXES)
 
-    def set(self, key: str, value: str, nx: bool = False, xx: bool = False) -> bool:
-        """SET key value [NX|XX]. Returns True if set, False if condition failed."""
+    def _check_owner(self, key: str, session_id: int | None) -> None:
+        """Raise ValueError if key is RO and session_id is not the owner."""
+        owner = self._owners.get(key)
+        if owner is not None and owner != session_id:
+            raise ValueError(f"READONLY key '{key}' owned by session {owner}")
+
+    def set(self, key: str, value: str, nx: bool = False, xx: bool = False,
+            ro: bool = False, session_id: int | None = None) -> bool:
+        """SET key value [NX|XX] [RO]. Returns True if set, False if condition failed."""
         if self._is_reserved(key):
             raise ValueError(f"READONLY cannot SET {key}")
+
+        self._check_owner(key, session_id)
 
         exists = key in self._data
 
@@ -42,6 +52,11 @@ class KeyValueStore:
             return False
 
         self._data[key] = value
+        if ro and session_id is not None:
+            self._owners[key] = session_id
+        elif not ro and key in self._owners and self._owners[key] == session_id:
+            # Owner re-sets without RO → remove protection
+            del self._owners[key]
         return True
 
     def get(self, key: str) -> str | None:
@@ -52,28 +67,32 @@ class KeyValueStore:
         """MGET key [key ...]. Returns list of values (None for missing)."""
         return [self._data.get(key) for key in keys]
 
-    def mset(self, pairs: list[tuple[str, str]]) -> None:
+    def mset(self, pairs: list[tuple[str, str]],
+             session_id: int | None = None) -> None:
         """MSET key val [key val ...]. Atomic multi-set."""
         # Check all keys first
         for key, _ in pairs:
             if self._is_reserved(key):
                 raise ValueError(f"READONLY cannot SET {key}")
+            self._check_owner(key, session_id)
 
         # Set all keys
         for key, value in pairs:
             self._data[key] = value
 
-    def delete(self, keys: list[str]) -> int:
+    def delete(self, keys: list[str], session_id: int | None = None) -> int:
         """DEL key [key ...]. Returns count of deleted keys."""
         # Check for reserved keys first
         for key in keys:
             if self._is_reserved(key):
                 raise ValueError(f"READONLY cannot DEL {key}")
+            self._check_owner(key, session_id)
 
         count = 0
         for key in keys:
             if key in self._data:
                 del self._data[key]
+                self._owners.pop(key, None)
                 count += 1
         return count
 
@@ -101,12 +120,21 @@ class KeyValueStore:
         _is_reserved = self._is_reserved
         return sum(1 for k in self._data if not _is_reserved(k))
 
-    def flushdb(self) -> None:
-        """FLUSHDB. Removes all client keys (preserves reserved prefixes)."""
+    def flushdb(self, session_id: int | None = None) -> None:
+        """FLUSHDB. Removes client keys (preserves reserved and other sessions' RO keys)."""
         _is_reserved = self._is_reserved
-        user_keys = [k for k in self._data if not _is_reserved(k)]
-        for k in user_keys:
+        for k in [k for k in self._data if not _is_reserved(k)]:
+            owner = self._owners.get(k)
+            if owner is not None and owner != session_id:
+                continue  # skip RO keys owned by other sessions
             del self._data[k]
+            self._owners.pop(k, None)
+
+    def release_owner(self, session_id: int) -> None:
+        """Release all RO keys owned by session_id (called on disconnect)."""
+        owned = [k for k, v in self._owners.items() if v == session_id]
+        for k in owned:
+            del self._owners[k]
 
 
 

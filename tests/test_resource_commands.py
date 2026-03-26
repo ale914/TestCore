@@ -91,7 +91,15 @@ class TestReadCommand:
     async def test_read_invalid_format(self):
         response = await handle_read(["nocolon"], ctx(SESSION_1))
         assert response.startswith(b'-ERR')
-        assert b'invalid resource address' in response
+
+    @pytest.mark.asyncio
+    async def test_read_separated_syntax(self):
+        """IREAD instrument resource (space-separated)."""
+        await setup_ready_instrument("vsg")
+        response = await handle_read(["vsg", "FREQ"], ctx(SESSION_1))
+        parser = RESPParser()
+        messages = parser.feed(response)
+        assert messages[0] is not None
 
     @pytest.mark.asyncio
     async def test_read_nonexistent_instrument(self):
@@ -131,6 +139,13 @@ class TestWriteCommand:
         registry.add("vsg", DRYRUN_PATH, config={"resources": ["FREQ"]})
         response = await handle_write(["vsg:FREQ", "900e6"], ctx(SESSION_1))
         assert b'-IDLE' in response
+
+    @pytest.mark.asyncio
+    async def test_write_separated_syntax(self):
+        """IWRITE instrument resource value (space-separated)."""
+        await setup_ready_instrument("vsg")
+        response = await handle_write(["vsg", "FREQ", "900e6"], ctx(SESSION_1))
+        assert response == b'+OK\r\n'
 
     @pytest.mark.asyncio
     async def test_write_wrong_args(self):
