@@ -60,12 +60,12 @@ class TestEventBus:
 
     def test_subscribe(self, bus):
         handler = make_mock_handler(1)
-        assert bus.subscribe(handler, "__event:instrument") is True
+        assert bus.subscribe(handler, "instrument") is True
 
     def test_subscribe_duplicate(self, bus):
         handler = make_mock_handler(1)
-        bus.subscribe(handler, "__event:instrument")
-        assert bus.subscribe(handler, "__event:instrument") is False
+        bus.subscribe(handler, "instrument")
+        assert bus.subscribe(handler, "instrument") is False
 
     def test_subscribe_invalid_channel(self, bus):
         handler = make_mock_handler(1)
@@ -73,43 +73,43 @@ class TestEventBus:
 
     def test_unsubscribe(self, bus):
         handler = make_mock_handler(1)
-        bus.subscribe(handler, "__event:instrument")
-        assert bus.unsubscribe(handler, "__event:instrument") is True
+        bus.subscribe(handler, "instrument")
+        assert bus.unsubscribe(handler, "instrument") is True
 
     def test_unsubscribe_not_subscribed(self, bus):
         handler = make_mock_handler(1)
-        assert bus.unsubscribe(handler, "__event:instrument") is False
+        assert bus.unsubscribe(handler, "instrument") is False
 
     def test_unsubscribe_all(self, bus):
         handler = make_mock_handler(1)
-        bus.subscribe(handler, "__event:instrument")
-        bus.subscribe(handler, "__event:lock")
+        bus.subscribe(handler, "instrument")
+        bus.subscribe(handler, "lock")
         removed = bus.unsubscribe_all(handler)
-        assert sorted(removed) == ["__event:instrument", "__event:lock"]
+        assert sorted(removed) == ["instrument", "lock"]
         assert bus.subscriber_channels(handler) == []
 
     def test_subscriber_channels(self, bus):
         handler = make_mock_handler(1)
-        bus.subscribe(handler, "__event:instrument")
-        bus.subscribe(handler, "__event:session")
+        bus.subscribe(handler, "instrument")
+        bus.subscribe(handler, "session")
         channels = bus.subscriber_channels(handler)
-        assert sorted(channels) == ["__event:instrument", "__event:session"]
+        assert sorted(channels) == ["instrument", "session"]
 
     def test_subscriber_count(self, bus):
         h1 = make_mock_handler(1)
         h2 = make_mock_handler(2)
-        bus.subscribe(h1, "__event:instrument")
-        bus.subscribe(h2, "__event:instrument")
-        assert bus.subscriber_count("__event:instrument") == 2
+        bus.subscribe(h1, "instrument")
+        bus.subscribe(h2, "instrument")
+        assert bus.subscriber_count("instrument") == 2
 
     @pytest.mark.asyncio
     async def test_publish_delivers_to_subscribers(self, bus):
         h1 = make_mock_handler(1)
         h2 = make_mock_handler(2)
-        bus.subscribe(h1, "__event:instrument")
-        bus.subscribe(h2, "__event:instrument")
+        bus.subscribe(h1, "instrument")
+        bus.subscribe(h2, "instrument")
 
-        count = await bus.publish("__event:instrument",
+        count = await bus.publish("instrument",
                                   {"type": "ADD", "instrument": "vsg"})
         assert count == 2
         h1._write.assert_called_once()
@@ -118,9 +118,9 @@ class TestEventBus:
     @pytest.mark.asyncio
     async def test_publish_message_format(self, bus):
         handler = make_mock_handler(1)
-        bus.subscribe(handler, "__event:lock")
+        bus.subscribe(handler, "lock")
 
-        await bus.publish("__event:lock",
+        await bus.publish("lock",
                           {"type": "acquired", "instrument": "vsg"})
 
         data = handler._write.call_args[0][0]
@@ -130,7 +130,7 @@ class TestEventBus:
 
         assert isinstance(result, list)
         assert result[0] == "event"
-        assert result[1] == "__event:lock"
+        assert result[1] == "lock"
         # Third element is JSON payload
         import json
         payload = json.loads(result[2])
@@ -139,7 +139,7 @@ class TestEventBus:
 
     @pytest.mark.asyncio
     async def test_publish_no_subscribers(self, bus):
-        count = await bus.publish("__event:instrument",
+        count = await bus.publish("instrument",
                                   {"type": "ADD"})
         assert count == 0
 
@@ -149,22 +149,22 @@ class TestEventBus:
         dead = make_mock_handler(2)
         dead._write.side_effect = Exception("connection lost")
 
-        bus.subscribe(alive, "__event:instrument")
-        bus.subscribe(dead, "__event:instrument")
+        bus.subscribe(alive, "instrument")
+        bus.subscribe(dead, "instrument")
 
-        count = await bus.publish("__event:instrument",
+        count = await bus.publish("instrument",
                                   {"type": "ADD"})
         assert count == 1
-        assert bus.subscriber_count("__event:instrument") == 1
+        assert bus.subscriber_count("instrument") == 1
 
     @pytest.mark.asyncio
     async def test_publish_only_matching_channel(self, bus):
         h1 = make_mock_handler(1)
         h2 = make_mock_handler(2)
-        bus.subscribe(h1, "__event:instrument")
-        bus.subscribe(h2, "__event:lock")
+        bus.subscribe(h1, "instrument")
+        bus.subscribe(h2, "lock")
 
-        await bus.publish("__event:instrument", {"type": "ADD"})
+        await bus.publish("instrument", {"type": "ADD"})
         h1._write.assert_called_once()
         h2._write.assert_not_called()
 
@@ -176,22 +176,22 @@ class TestSubscribeCommand:
     async def test_subscribe_single_channel(self, mock_server):
         handler = make_mock_handler(1)
         response = await handle_subscribe(
-            ["__event:instrument"], ctx(1, handler))
+            ["instrument"], ctx(1, handler))
         parser = RESPParser()
         messages = parser.feed(response)
         # Redis format: ["subscribe", channel, count]
-        assert messages[0] == ["subscribe", "__event:instrument", 1]
+        assert messages[0] == ["subscribe", "instrument", 1]
         assert handler.subscribing is True
 
     @pytest.mark.asyncio
     async def test_subscribe_multiple_channels(self, mock_server):
         handler = make_mock_handler(1)
         response = await handle_subscribe(
-            ["__event:instrument", "__event:lock"], ctx(1, handler))
+            ["instrument", "lock"], ctx(1, handler))
         parser = RESPParser()
         messages = parser.feed(response)
-        assert messages[0] == ["subscribe", "__event:instrument", 1]
-        assert messages[1] == ["subscribe", "__event:lock", 2]
+        assert messages[0] == ["subscribe", "instrument", 1]
+        assert messages[1] == ["subscribe", "lock", 2]
 
     @pytest.mark.asyncio
     async def test_subscribe_invalid_channel(self, mock_server):
@@ -209,7 +209,7 @@ class TestSubscribeCommand:
 
     @pytest.mark.asyncio
     async def test_subscribe_no_session(self):
-        response = await handle_subscribe(["__event:instrument"])
+        response = await handle_subscribe(["instrument"])
         assert b"no session" in response
 
     @pytest.mark.asyncio
@@ -235,7 +235,7 @@ class TestSubscribeCommand:
     async def test_subscriber_mode_allows_unsubscribe(self, mock_server):
         handler = make_mock_handler(1)
         # First subscribe
-        await handle_subscribe(["__event:instrument"], ctx(1, handler))
+        await handle_subscribe(["instrument"], ctx(1, handler))
         assert handler.subscribing is True
 
         # Unsubscribe via dispatch should work
@@ -251,13 +251,13 @@ class TestUnsubscribeCommand:
     async def test_unsubscribe_specific(self, mock_server):
         handler = make_mock_handler(1)
         await handle_subscribe(
-            ["__event:instrument", "__event:lock"], ctx(1, handler))
+            ["instrument", "lock"], ctx(1, handler))
 
         response = await handle_unsubscribe(
-            ["__event:instrument"], ctx(1, handler))
+            ["instrument"], ctx(1, handler))
         parser = RESPParser()
         messages = parser.feed(response)
-        assert messages[0] == ["unsubscribe", "__event:instrument", 1]
+        assert messages[0] == ["unsubscribe", "instrument", 1]
         # Still subscribed to lock, so still in subscriber mode
         assert handler.subscribing is True
 
@@ -265,7 +265,7 @@ class TestUnsubscribeCommand:
     async def test_unsubscribe_all(self, mock_server):
         handler = make_mock_handler(1)
         await handle_subscribe(
-            ["__event:instrument", "__event:lock"], ctx(1, handler))
+            ["instrument", "lock"], ctx(1, handler))
 
         response = await handle_unsubscribe([], ctx(1, handler))
         parser = RESPParser()
@@ -277,10 +277,10 @@ class TestUnsubscribeCommand:
     @pytest.mark.asyncio
     async def test_unsubscribe_exits_subscriber_mode(self, mock_server):
         handler = make_mock_handler(1)
-        await handle_subscribe(["__event:instrument"], ctx(1, handler))
+        await handle_subscribe(["instrument"], ctx(1, handler))
         assert handler.subscribing is True
 
-        await handle_unsubscribe(["__event:instrument"], ctx(1, handler))
+        await handle_unsubscribe(["instrument"], ctx(1, handler))
         assert handler.subscribing is False
 
     @pytest.mark.asyncio
@@ -306,14 +306,14 @@ class TestEventIntegration:
     async def test_subscribe_receives_published_events(self, mock_server):
         """Subscriber receives events published to their channel."""
         handler = make_mock_handler(1)
-        await handle_subscribe(["__event:instrument"], ctx(1, handler))
+        await handle_subscribe(["instrument"], ctx(1, handler))
 
         # Reset write mock (subscribe itself sends a response)
         handler._write.reset_mock()
 
         # Publish an event
         bus = get_event_bus()
-        await bus.publish("__event:instrument",
+        await bus.publish("instrument",
                           {"type": "ADD", "instrument": "vsg"})
 
         handler._write.assert_called_once()
@@ -321,17 +321,17 @@ class TestEventIntegration:
         parser = RESPParser()
         messages = parser.feed(data)
         assert messages[0][0] == "event"
-        assert messages[0][1] == "__event:instrument"
+        assert messages[0][1] == "instrument"
 
     @pytest.mark.asyncio
     async def test_kv_subscribe(self, mock_server):
         """Subscribe to __event:kv channel."""
         handler = make_mock_handler(1)
         response = await handle_subscribe(
-            ["__event:kv"], ctx(1, handler))
+            ["kv"], ctx(1, handler))
         parser = RESPParser()
         messages = parser.feed(response)
-        assert messages[0] == ["subscribe", "__event:kv", 1]
+        assert messages[0] == ["subscribe", "kv", 1]
 
     @pytest.mark.asyncio
     async def test_kset_publishes_kv_event(self, mock_server):
@@ -341,7 +341,7 @@ class TestEventIntegration:
         store._data.clear()
 
         handler = make_mock_handler(1)
-        await handle_subscribe(["__event:kv"], ctx(1, handler))
+        await handle_subscribe(["kv"], ctx(1, handler))
         handler._write.reset_mock()
 
         # KSET from another session
@@ -353,7 +353,7 @@ class TestEventIntegration:
         parser = RESPParser()
         messages = parser.feed(data)
         assert messages[0][0] == "event"
-        assert messages[0][1] == "__event:kv"
+        assert messages[0][1] == "kv"
 
         import json
         payload = json.loads(messages[0][2])
@@ -371,7 +371,7 @@ class TestEventIntegration:
         store._data["existing"] = "old"
 
         handler = make_mock_handler(1)
-        await handle_subscribe(["__event:kv"], ctx(1, handler))
+        await handle_subscribe(["kv"], ctx(1, handler))
         handler._write.reset_mock()
 
         from testcore.commands import handle_set
@@ -388,7 +388,7 @@ class TestEventIntegration:
         store._data.clear()
 
         handler = make_mock_handler(1)
-        await handle_subscribe(["__event:kv:alert:*"], ctx(1, handler))
+        await handle_subscribe(["kv:alert:*"], ctx(1, handler))
         handler._write.reset_mock()
 
         from testcore.commands import handle_set
@@ -415,7 +415,7 @@ class TestEventIntegration:
         store._data.clear()
 
         handler = make_mock_handler(1)
-        await handle_subscribe(["__event:kv:result"], ctx(1, handler))
+        await handle_subscribe(["kv:result"], ctx(1, handler))
         handler._write.reset_mock()
 
         from testcore.commands import handle_set
@@ -433,7 +433,7 @@ class TestEventIntegration:
         store._data.clear()
 
         handler = make_mock_handler(1)
-        await handle_subscribe(["__event:kv"], ctx(1, handler))
+        await handle_subscribe(["kv"], ctx(1, handler))
         handler._write.reset_mock()
 
         from testcore.commands import handle_set
@@ -451,8 +451,8 @@ class TestEventIntegration:
 
         h_alert = make_mock_handler(1)
         h_meas = make_mock_handler(2)
-        await handle_subscribe(["__event:kv:alert:*"], ctx(1, h_alert))
-        await handle_subscribe(["__event:kv:meas:*"], ctx(2, h_meas))
+        await handle_subscribe(["kv:alert:*"], ctx(1, h_alert))
+        await handle_subscribe(["kv:meas:*"], ctx(2, h_meas))
         h_alert._write.reset_mock()
         h_meas._write.reset_mock()
 
@@ -472,7 +472,7 @@ class TestEventIntegration:
         store._data.clear()
 
         handler = make_mock_handler(1)
-        await handle_subscribe(["__event:kv:*temp*"], ctx(1, handler))
+        await handle_subscribe(["kv:*temp*"], ctx(1, handler))
         handler._write.reset_mock()
 
         from testcore.commands import handle_set

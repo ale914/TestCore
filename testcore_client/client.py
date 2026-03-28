@@ -25,7 +25,7 @@ class TestCore:
     Or as context manager:
         with TestCore(name="my_test") as tc:
             tc.ilock("vsg")
-            tc.iread("vsg", "FREQ")
+            tc.iread("vsg FREQ")
     """
 
     def __init__(self, host: str = "127.0.0.1", port: int = 6399,
@@ -207,6 +207,54 @@ class TestCore:
         return dict(zip(r[::2], r[1::2]))
 
     # ------------------------------------------------------------------
+    # MEAS commands
+    # ------------------------------------------------------------------
+
+    def mget(self, target: str) -> dict | None:
+        """MGET instrument resource. Returns parsed MEAS dict or None.
+
+        Example:
+            tc.mget("sensor1 TEMP")
+            # -> {"value": "72.3", "ts": 1706140800.123, "status": "OK"}
+        """
+        instrument, resource = target.split(" ", 1)
+        r = self._cmd("MGET", instrument, resource)
+        if r is None:
+            return None
+        return json.loads(r)
+
+    def mgetall(self, instrument: str | None = None) -> dict[str, dict]:
+        """MGETALL [instrument]. Returns dict of {key: meas_dict}.
+
+        Example:
+            tc.mgetall()
+            # -> {"sensor1:TEMP": {"value": "72.3", ...}, ...}
+        """
+        args = ["MGETALL"]
+        if instrument:
+            args.append(instrument)
+        r = self._cmd(*args)
+        if not r:
+            return {}
+        # Flat array [key1, json1, key2, json2, ...] → dict
+        result = {}
+        for i in range(0, len(r), 2):
+            result[r[i]] = json.loads(r[i + 1])
+        return result
+
+    def mkeys(self, instrument: str | None = None) -> list[str]:
+        """MKEYS [instrument]. Returns list of MEAS key names."""
+        args = ["MKEYS"]
+        if instrument:
+            args.append(instrument)
+        r = self._cmd(*args)
+        if r is None:
+            return []
+        if isinstance(r, str):
+            return [r]
+        return r
+
+    # ------------------------------------------------------------------
     # Server introspection (§6.1)
     # ------------------------------------------------------------------
 
@@ -216,9 +264,10 @@ class TestCore:
         return json.loads(r)
 
     def journal(self, *args: str) -> list[str]:
-        """JOURNAL [count | +offset [count] | ALL | CLEAR].
+        """JOURNAL [count | +offset [count] | ALL | CLEAR] [REL].
 
         Returns list of formatted journal entries, or int for CLEAR.
+        Append 'REL' for relative timestamps (delta between commands).
         """
         r = self._cmd("JOURNAL", *args)
         if isinstance(r, int):
@@ -242,6 +291,8 @@ class TestCore:
             tc.iadd("pm", "keysight_u2000", "COM3", baudrate=115200, timeout=10000)
             tc.iadd("sim", "dryrun")
         """
+        if " " in name:
+            raise ValueError("instrument name must not contain spaces")
         args = ["IADD", name, driver]
         if address:
             args.append(address)
@@ -276,6 +327,10 @@ class TestCore:
         if isinstance(r, str):
             return [r]
         return r
+
+    def iping(self, name: str) -> str:
+        """IPING name. Send *IDN? without lock. Returns IDN string."""
+        return self._cmd("IPING", name)
 
     def driver_list(self) -> list[str]:
         """DRIVER LIST. Returns list of loaded drivers."""
@@ -335,103 +390,96 @@ class TestCore:
         r = self._cmd("IRESET", name)
         return r == "OK"
 
-    def ialign(self, name: str) -> bool:
-        """IALIGN name. Align/calibrate instrument. Returns True."""
-        r = self._cmd("IALIGN", name)
+    def ialign(self, *names: str) -> bool:
+        """IALIGN name [name ...]. Accept current state. Returns True."""
+        if not names:
+            raise ValueError("at least one instrument name required")
+        r = self._cmd("IALIGN", *names)
         return r == "OK"
 
     # ------------------------------------------------------------------
     # Read / Write / Raw / Load (§6.5)
     # ------------------------------------------------------------------
 
-    def iread(self, instrument: str, resource: str) -> str:
-        """IREAD instrument resource. Returns value string.
+    def iread(self, target: str, meas: bool = False) -> str:
+        """IREAD instrument resource [MEAS]. Returns value string.
+
+        When meas=True, the server also writes a MEAS entry visible
+        to all clients via MGET and meas events.
 
         Example:
-            tc.iread("awg", "CH1:FREQ")
+            tc.iread("awg CH1:FREQ")
+            tc.iread("sensor1 TEMP", meas=True)
         """
-        return self._cmd("IREAD", instrument, resource)
+        instrument, resource = target.split(" ", 1)
+        args = ["IREAD", instrument, resource]
+        if meas:
+            args.append("MEAS")
+        return self._cmd(*args)
 
-    def imread(self, *resources: str) -> list[str | None]:
+    def imread(self, *targets: str) -> list[str | None]:
         """IMREAD instrument:resource [instrument:resource ...]. Returns list of values.
 
+        Each target is "instrument resource" (split on first space).
+
         Example:
-            tc.imread("awg:CH1:FREQ", "psu:VOLT", "dmm:DC_VOLTAGE")
+            tc.imread("awg CH1:FREQ", "psu VOLT", "dmm DC_VOLTAGE")
         """
-        r = self._cmd("IMREAD", *resources)
+        addrs = []
+        for t in targets:
+            instrument, resource = t.split(" ", 1)
+            addrs.append(f"{instrument}:{resource}")
+        r = self._cmd("IMREAD", *addrs)
         if isinstance(r, list):
             return r
         return [r]
 
-    def iwrite(self, instrument: str, resource: str,
-               value: str | int | float) -> bool:
+    def iwrite(self, target: str, value: str | int | float) -> bool:
         """IWRITE instrument resource value. Returns True.
 
         Example:
-            tc.iwrite("awg", "CH1:FREQ", 1000000000)
-            tc.iwrite("psu", "VOLT", 3.3)
+            tc.iwrite("awg CH1:FREQ", 1000000000)
+            tc.iwrite("psu VOLT", 3.3)
         """
+        instrument, resource = target.split(" ", 1)
         r = self._cmd("IWRITE", instrument, resource, str(value))
         return r == "OK"
 
-    def iraw(self, instrument: str, scpi_command: str) -> str | None:
-        """IRAW instrument scpi_command. Returns response or None."""
+    def iraw(self, target: str) -> str | None:
+        """IRAW instrument scpi_command. Returns response or None.
+
+        Example:
+            tc.iraw("awg *IDN?")
+            tc.iraw("psu OUTP ON")
+        """
+        instrument, scpi_command = target.split(" ", 1)
         r = self._cmd("IRAW", instrument, scpi_command)
         if r == "OK":
             return None
         return r
 
-    def iload(self, instrument: str, target: str, file_path: str) -> str:
+    def iload(self, target: str, file_path: str) -> str:
         """ILOAD instrument target file_path. Load file into instrument.
 
         Returns status string (e.g. '1024 points loaded').
-        """
-        return self._cmd("ILOAD", instrument, target, file_path)
 
-    def isave(self, instrument: str, target: str, file_path: str) -> str:
+        Example:
+            tc.iload("awg ARB1", "/data/waveform.csv")
+        """
+        instrument, res_target = target.split(" ", 1)
+        return self._cmd("ILOAD", instrument, res_target, file_path)
+
+    def isave(self, target: str, file_path: str) -> str:
         """ISAVE instrument target file_path. Save data from instrument to file.
 
         Target is driver-specific: 'SCREEN', 'TRACE1', 'DATA', etc.
         Returns status string (e.g. '72 bytes saved').
+
+        Example:
+            tc.isave("scope SCREEN", "/data/screenshot.png")
         """
-        return self._cmd("ISAVE", instrument, target, file_path)
-
-    # ------------------------------------------------------------------
-    # Alias (§6.6)
-    # ------------------------------------------------------------------
-
-    def alias_set(self, name: str, alias_type: str, target: str) -> bool:
-        """ALIAS SET name type target. Returns True."""
-        r = self._cmd("ALIAS", "SET", name, alias_type, target)
-        return r == "OK"
-
-    def alias_get(self, name: str) -> tuple[str, str]:
-        """ALIAS GET name. Returns (type, target)."""
-        r = self._cmd("ALIAS", "GET", name)
-        return (r[0], r[1])
-
-    def alias_del(self, name: str) -> bool:
-        """ALIAS DEL name. Returns True."""
-        r = self._cmd("ALIAS", "DEL", name)
-        return r == "OK"
-
-    def alias_list(self) -> list[str]:
-        """ALIAS LIST. Returns list of alias names."""
-        r = self._cmd("ALIAS", "LIST")
-        if r is None:
-            return []
-        if isinstance(r, str):
-            return [r]
-        return r
-
-    def aread(self, alias: str) -> str:
-        """AREAD alias. Read through alias. Returns value."""
-        return self._cmd("AREAD", alias)
-
-    def awrite(self, alias: str, value: str | int | float) -> bool:
-        """AWRITE alias value. Write through SUB alias. Returns True."""
-        r = self._cmd("AWRITE", alias, str(value))
-        return r == "OK"
+        instrument, res_target = target.split(" ", 1)
+        return self._cmd("ISAVE", instrument, res_target, file_path)
 
     # ------------------------------------------------------------------
     # Events / Subscribe (§5.3)
@@ -478,7 +526,7 @@ class TestCore:
         """Subscribe to event channels and yield (channel, payload) tuples.
 
         Usage:
-            for channel, payload in tc.listen("__event:kv"):
+            for channel, payload in tc.listen("kv"):
                 print(channel, payload)
                 if done:
                     break
@@ -545,6 +593,7 @@ class Pipeline:
     # Commands that cannot be used in a pipeline
     _BLOCKED: frozenset[str] = frozenset({
         "DUMP", "JOURNAL", "MONITOR", "SUBSCRIBE", "UNSUBSCRIBE",
+        "IINFO", "IRESOURCES", "IPING", "ILOCKED", "DRIVER",
     })
 
     def __init__(self, conn: Connection):
@@ -708,36 +757,71 @@ class Pipeline:
             args.append("TST")
         return self._queue(self._parse_ok, *args)
 
-    def iread(self, instrument: str, resource: str) -> Pipeline:
-        return self._queue(self._parse_identity, "IREAD", instrument, resource)
+    def iread(self, target: str, meas: bool = False) -> Pipeline:
+        instrument, resource = target.split(" ", 1)
+        args = ["IREAD", instrument, resource]
+        if meas:
+            args.append("MEAS")
+        return self._queue(self._parse_identity, *args)
 
-    def imread(self, *resources: str) -> Pipeline:
+    def imread(self, *targets: str) -> Pipeline:
+        addrs = []
+        for t in targets:
+            instrument, resource = t.split(" ", 1)
+            addrs.append(f"{instrument}:{resource}")
         def parse(r):
             return r if isinstance(r, list) else [r]
-        return self._queue(parse, "IMREAD", *resources)
+        return self._queue(parse, "IMREAD", *addrs)
 
-    def iwrite(self, instrument: str, resource: str,
-               value: str | int | float) -> Pipeline:
+    def iwrite(self, target: str, value: str | int | float) -> Pipeline:
+        instrument, resource = target.split(" ", 1)
         return self._queue(self._parse_ok, "IWRITE", instrument, resource, str(value))
 
-    def iraw(self, instrument: str, scpi_command: str) -> Pipeline:
+    def iraw(self, target: str) -> Pipeline:
+        instrument, scpi_command = target.split(" ", 1)
         return self._queue(
             lambda r: None if r == "OK" else r, "IRAW", instrument, scpi_command
         )
 
-    def iload(self, instrument: str, target: str, file_path: str) -> Pipeline:
-        return self._queue(self._parse_identity, "ILOAD", instrument, target, file_path)
+    def iload(self, target: str, file_path: str) -> Pipeline:
+        instrument, res_target = target.split(" ", 1)
+        return self._queue(self._parse_identity, "ILOAD", instrument, res_target, file_path)
 
-    def isave(self, instrument: str, target: str, file_path: str) -> Pipeline:
-        return self._queue(self._parse_identity, "ISAVE", instrument, target, file_path)
+    def isave(self, target: str, file_path: str) -> Pipeline:
+        instrument, res_target = target.split(" ", 1)
+        return self._queue(self._parse_identity, "ISAVE", instrument, res_target, file_path)
 
-    # -- Alias commands ---
+    def ireset(self, name: str) -> Pipeline:
+        return self._queue(self._parse_ok, "IRESET", name)
 
-    def alias_set(self, name: str, alias_type: str, target: str) -> Pipeline:
-        return self._queue(self._parse_ok, "ALIAS", "SET", name, alias_type, target)
+    def ialign(self, *names: str) -> Pipeline:
+        return self._queue(self._parse_ok, "IALIGN", *names)
 
-    def aread(self, alias: str) -> Pipeline:
-        return self._queue(self._parse_identity, "AREAD", alias)
+    # -- MEAS commands ---
 
-    def awrite(self, alias: str, value: str | int | float) -> Pipeline:
-        return self._queue(self._parse_ok, "AWRITE", alias, str(value))
+    def mget(self, target: str) -> Pipeline:
+        instrument, resource = target.split(" ", 1)
+        def parse(r):
+            if r is None:
+                return None
+            return json.loads(r)
+        return self._queue(parse, "MGET", instrument, resource)
+
+    def mgetall(self, instrument: str | None = None) -> Pipeline:
+        args = ["MGETALL"]
+        if instrument:
+            args.append(instrument)
+        def parse(r):
+            if not r:
+                return {}
+            result = {}
+            for i in range(0, len(r), 2):
+                result[r[i]] = json.loads(r[i + 1])
+            return result
+        return self._queue(parse, *args)
+
+    def mkeys(self, instrument: str | None = None) -> Pipeline:
+        args = ["MKEYS"]
+        if instrument:
+            args.append(instrument)
+        return self._queue(self._parse_list, *args)

@@ -9,12 +9,14 @@ Clients subscribe via SUBSCRIBE command; the connection enters subscriber
 mode and can only receive events + issue SUBSCRIBE/UNSUBSCRIBE/PING.
 
 Event channels:
-    __event:watch       — Watch guard triggers
-    __event:instrument  — State changes (ADD, REMOVE, INIT, FAULT, etc.)
-    __event:lock        — Lock acquired / released / force-released
-    __event:session     — Client connect / disconnect
-    __event:kv          — KV store changes (KSET), supports glob key filter
-                          e.g. __event:kv:alert:* receives only keys matching alert:*
+    watch       — Watch guard triggers
+    instrument  — State changes (ADD, REMOVE, INIT, FAULT, etc.)
+    lock        — Lock acquired / released / force-released
+    session     — Client connect / disconnect
+    kv          — KV store changes (KSET), supports glob key filter
+                  e.g. kv:alert:* receives only keys matching alert:*
+    meas        — MEAS updates, supports instrument:resource filter
+                  e.g. meas:vsg:CH1:FREQ
 """
 from __future__ import annotations
 
@@ -33,32 +35,29 @@ logger = logging.getLogger(__name__)
 
 # Valid event channel bases
 VALID_CHANNELS = frozenset({
-    "__event:watch",
-    "__event:instrument",
-    "__event:lock",
-    "__event:session",
-    "__event:kv",
+    "watch",
+    "instrument",
+    "lock",
+    "session",
+    "kv",
+    "meas",
 })
-
-# KV channel prefix — subscriptions starting with this can have a glob filter
-_KV_CHANNEL_PREFIX = "__event:kv"
 
 
 def _parse_channel(channel: str) -> tuple[str, str | None]:
     """Parse channel into (base_channel, filter_pattern).
 
-    '__event:kv'          → ('__event:kv', None)       — all KSET
-    '__event:kv:alert:*'  → ('__event:kv', 'alert:*')  — glob filter
-    '__event:instrument'  → ('__event:instrument', None)
+    For any valid channel, a suffix after the base becomes a glob filter:
+        'kv'             → ('kv', None)
+        'kv:alert:*'     → ('kv', 'alert:*')
+        'meas:sensor1:*' → ('meas', 'sensor1:*')
+        'instrument'     → ('instrument', None)
     """
-    if channel.startswith(_KV_CHANNEL_PREFIX):
-        suffix = channel[len(_KV_CHANNEL_PREFIX):]
-        if suffix and suffix[0] == ":":
-            return _KV_CHANNEL_PREFIX, suffix[1:]
-        elif suffix == "":
-            return _KV_CHANNEL_PREFIX, None
-        # Invalid format
-        return channel, None
+    for base in VALID_CHANNELS:
+        if channel == base:
+            return base, None
+        if channel.startswith(base + ":"):
+            return base, channel[len(base) + 1:]
     return channel, None
 
 
@@ -69,7 +68,7 @@ def is_valid_channel(channel: str) -> bool:
 
 
 class _Subscription:
-    """A single subscription: handler + optional key filter for __event:kv."""
+    """A single subscription: handler + optional key filter."""
     __slots__ = ("handler", "pattern", "channel_spec")
 
     def __init__(self, handler: ClientHandler, pattern: str | None,
@@ -95,10 +94,10 @@ class EventBus:
     channels it is subscribed to. The bus maintains channel → set[_Subscription]
     mappings for efficient broadcast.
 
-    __event:kv supports optional glob key filters:
-        __event:kv           — all KSET events
-        __event:kv:alert:*   — only keys matching alert:*
-        __event:kv:result    — only the exact key "result"
+    kv supports optional glob key filters:
+        kv           — all KSET events
+        kv:alert:*   — only keys matching alert:*
+        kv:result    — only the exact key "result"
     """
 
     def __init__(self):
@@ -155,13 +154,13 @@ class EventBus:
         return len(self._subscriptions.get(base, set()))
 
     async def publish(self, channel: str, payload: dict,
-                      kv_key: str | None = None) -> int:
+                      filter_key: str | None = None) -> int:
         """Publish event to all subscribers of channel.
 
         Message format (RESP array): ["event", "<channel>", "<json_payload>"]
 
-        For __event:kv, pass kv_key to enable glob filtering.
-        Subscribers with a filter only receive events where the key matches.
+        Pass filter_key to enable glob filtering on channels that support it.
+        Subscribers with a pattern only receive events where the key matches.
 
         Returns number of clients that received the message.
         """
@@ -175,9 +174,9 @@ class EventBus:
         delivered = 0
         dead = []
         for sub in subs:
-            # Apply kv key filter
-            if sub.pattern is not None and kv_key is not None:
-                if not fnmatch.fnmatch(kv_key, sub.pattern):
+            # Apply filter
+            if sub.pattern is not None and filter_key is not None:
+                if not fnmatch.fnmatch(filter_key, sub.pattern):
                     continue
 
             try:
@@ -187,11 +186,8 @@ class EventBus:
                 dead.append(sub)
 
         # Clean up dead subscribers
-        for sub in dead:
-            subs.discard(sub)
-            logger.debug(
-                f"Removed dead subscriber {sub.handler.client_id} "
-                f"from {channel}")
+        if dead:
+            subs.difference_update(dead)
 
         return delivered
 
@@ -219,7 +215,7 @@ async def publish_instrument_event(event_type: str, instrument: str, **kwargs):
         "timestamp": int(time.time() * 1_000_000),
         **kwargs,
     }
-    await bus.publish("__event:instrument", payload)
+    await bus.publish("instrument", payload)
 
 
 async def publish_lock_event(event_type: str, instrument: str, session_id: int, **kwargs):
@@ -232,7 +228,7 @@ async def publish_lock_event(event_type: str, instrument: str, session_id: int, 
         "timestamp": int(time.time() * 1_000_000),
         **kwargs,
     }
-    await bus.publish("__event:lock", payload)
+    await bus.publish("lock", payload)
 
 
 async def publish_session_event(event_type: str, session_id: int, **kwargs):
@@ -244,7 +240,7 @@ async def publish_session_event(event_type: str, session_id: int, **kwargs):
         "timestamp": int(time.time() * 1_000_000),
         **kwargs,
     }
-    await bus.publish("__event:session", payload)
+    await bus.publish("session", payload)
 
 
 async def publish_kv_event(key: str, value: str, session_id: int | None = None):
@@ -258,4 +254,20 @@ async def publish_kv_event(key: str, value: str, session_id: int | None = None):
     }
     if session_id is not None:
         payload["session_id"] = session_id
-    await bus.publish("__event:kv", payload, kv_key=key)
+    await bus.publish("kv", payload, filter_key=key)
+
+
+async def publish_meas_event(instrument: str, resource: str,
+                              value: str | None, ts: float, status: str):
+    """Publish a MEAS event on meas channel with instrument:resource filtering."""
+    bus = get_event_bus()
+    payload = {
+        "type": "meas",
+        "instrument": instrument,
+        "resource": resource,
+        "value": value,
+        "ts": ts,
+        "status": status,
+    }
+    await bus.publish("meas", payload,
+                      filter_key=f"{instrument}:{resource}")

@@ -9,7 +9,8 @@ import pytest
 from testcore.commands import (
     handle_instrument_add, handle_instrument_remove, handle_instrument_init,
     handle_instrument_info, handle_instrument_list, handle_instrument_resources,
-    handle_instrument_reset, handle_align, handle_driver_list
+    handle_instrument_ping, handle_instrument_reset, handle_align,
+    handle_driver_list
 )
 from testcore.instruments import get_registry, InstrumentState
 from testcore.protocol import RESPParser
@@ -270,3 +271,54 @@ class TestDriverListCommand:
         parser = RESPParser()
         messages = parser.feed(response)
         assert len(messages[0]) == 1
+
+
+class TestInstrumentPingCommand:
+    """Tests for IPING command — connectivity check without lock."""
+
+    @pytest.mark.asyncio
+    async def test_ping_idle(self):
+        """IPING works on IDLE instrument (no lock needed)."""
+        await handle_instrument_add(["vsg", DRYRUN_PATH])
+        response = await handle_instrument_ping(["vsg"])
+        parser = RESPParser()
+        messages = parser.feed(response)
+        # DryRun driver returns IDN string via passthrough
+        assert messages[0] is not None
+        assert isinstance(messages[0], str)
+
+    @pytest.mark.asyncio
+    async def test_ping_locked(self):
+        """IPING works on LOCKED instrument."""
+        await add_and_lock("vsg", ["FREQ"])
+        response = await handle_instrument_ping(["vsg"])
+        assert not response.startswith(b'-')
+
+    @pytest.mark.asyncio
+    async def test_ping_ready(self):
+        """IPING works on READY instrument."""
+        await add_and_lock("vsg", ["FREQ"])
+        await handle_instrument_init(["vsg"])
+        response = await handle_instrument_ping(["vsg"])
+        assert not response.startswith(b'-')
+
+    @pytest.mark.asyncio
+    async def test_ping_fault(self):
+        """IPING on FAULT instrument returns error."""
+        await add_and_lock("vsg", ["FREQ"])
+        inst = get_registry().get("vsg")
+        inst.state = InstrumentState.FAULT
+        response = await handle_instrument_ping(["vsg"])
+        assert b'-FAULT' in response
+
+    @pytest.mark.asyncio
+    async def test_ping_nonexistent(self):
+        """IPING on unknown instrument returns error."""
+        response = await handle_instrument_ping(["nonexistent"])
+        assert response.startswith(b'-')
+
+    @pytest.mark.asyncio
+    async def test_ping_wrong_args(self):
+        """IPING with no args returns error."""
+        response = await handle_instrument_ping([])
+        assert response.startswith(b'-ERR')

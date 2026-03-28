@@ -156,11 +156,20 @@ class ClientHandler:
         # Release all locks held by this session (spec §9.1)
         try:
             registry = get_registry()
+            from .store import get_store
+            store = get_store()
             for name in registry.list_instruments():
                 inst = registry.get(name)
                 if inst.lock_owner == self.client_id:
                     try:
                         registry.unlock(name, self.client_id)
+                        # Invalidate MEAS for this instrument
+                        invalidated = store.invalidate_meas(name)
+                        from .events import publish_meas_event
+                        for inst_name, resource, meas in invalidated:
+                            await publish_meas_event(
+                                inst_name, resource,
+                                meas.value, meas.ts, meas.status)
                         logger.info(
                             f"Client {self.client_id} disconnect: "
                             f"unlocked {name}")

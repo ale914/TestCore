@@ -51,6 +51,14 @@ bench-a#1 > KGET temp
 bench-a#1 > IADD sim dryrun
 OK
 
+bench-a#1 > IPING sim
+"DryRun Simulator, Model 1000, SN 000000, v1.0"
+
+bench-a#1 > JOURNAL 5 REL
++0.000000 [bench-a] KSET temp "22.5" -> ok
++0.012345 [bench-a] IADD sim dryrun -> ok
++0.003210 [bench-a] IPING sim -> ok
+
 bench-a#1 > MONITOR
 OK
 monitor mode — press any key to stop

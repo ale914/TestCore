@@ -24,7 +24,6 @@ from testcore_client import (
     LockedError,
     NotInitError,
     FaultError,
-    NoAliasError,
 )
 
 
@@ -34,7 +33,7 @@ from testcore_client import (
 
 @pytest.fixture(autouse=True)
 def reset_state():
-    """Reset store, registry, event bus, aliases before each test."""
+    """Reset store, registry, event bus before each test."""
     store = get_store()
     store._data.clear()
     registry = get_registry()
@@ -46,8 +45,6 @@ def reset_state():
     registry._instruments.clear()
     import testcore.events as events_mod
     events_mod._event_bus = None
-    from testcore.commands import _aliases
-    _aliases.clear()
 
 
 @pytest.fixture
@@ -250,15 +247,15 @@ class TestInstrumentCommands:
         tc.iadd("gen", "dryrun")
         tc.ilock("gen")
         tc.iinit("gen")
-        assert tc.iwrite("gen", "FREQ", "1e6") is True
-        val = tc.iread("gen", "FREQ")
+        assert tc.iwrite("gen FREQ", "1e6") is True
+        val = tc.iread("gen FREQ")
         assert val is not None
 
     def test_imread(self, tc):
         tc.iadd("m1", "dryrun")
         tc.ilock("m1")
         tc.iinit("m1")
-        results = tc.imread("m1:FREQ", "m1:VOUT")
+        results = tc.imread("m1 FREQ", "m1 VOUT")
         assert isinstance(results, list)
         assert len(results) == 2
 
@@ -266,7 +263,7 @@ class TestInstrumentCommands:
         tc.iadd("raw1", "dryrun")
         tc.ilock("raw1")
         tc.iinit("raw1")
-        result = tc.iraw("raw1", "*IDN?")
+        result = tc.iraw("raw1 *IDN?")
         assert result is not None
 
     def test_isave_screen(self, tc, tmp_path):
@@ -274,7 +271,7 @@ class TestInstrumentCommands:
         tc.ilock("sv1")
         tc.iinit("sv1")
         out_file = str(tmp_path / "screen.png")
-        result = tc.isave("sv1", "SCREEN", out_file)
+        result = tc.isave("sv1 SCREEN", out_file)
         assert "bytes saved" in result
         # Verify file was actually created
         import os
@@ -285,9 +282,9 @@ class TestInstrumentCommands:
         tc.iadd("sv2", "dryrun")
         tc.ilock("sv2")
         tc.iinit("sv2")
-        tc.iwrite("sv2", "FREQ", "1e6")
+        tc.iwrite("sv2 FREQ", "1e6")
         out_file = str(tmp_path / "data.csv")
-        result = tc.isave("sv2", "DATA", out_file)
+        result = tc.isave("sv2 DATA", out_file)
         assert "rows saved" in result
         with open(out_file, "r") as f:
             content = f.read()
@@ -299,7 +296,7 @@ class TestInstrumentCommands:
         tc.iinit("sv3")
         from testcore_client import DriverError as ClientDriverError
         with pytest.raises(ClientDriverError):
-            tc.isave("sv3", "UNKNOWN", str(tmp_path / "x.bin"))
+            tc.isave("sv3 UNKNOWN", str(tmp_path / "x.bin"))
 
     def test_iinfo(self, tc):
         tc.iadd("info1", "dryrun")
@@ -316,7 +313,7 @@ class TestInstrumentCommands:
     def test_idle_error(self, tc):
         tc.iadd("idle1", "dryrun")
         with pytest.raises(IdleError):
-            tc.iread("idle1", "FREQ")
+            tc.iread("idle1 FREQ")
 
     def test_locked_error(self, server_port):
         tc1 = TestCore(host="127.0.0.1", port=server_port)
@@ -332,41 +329,12 @@ class TestInstrumentCommands:
         tc.iadd("ni1", "dryrun")
         tc.ilock("ni1")
         with pytest.raises(NotInitError):
-            tc.iread("ni1", "FREQ")
+            tc.iread("ni1 FREQ")
 
     def test_driver_list(self, tc):
         tc.iadd("drv1", "dryrun")
         drivers = tc.driver_list()
         assert isinstance(drivers, list)
-
-
-# ---------------------------------------------------------------------------
-# Alias commands
-# ---------------------------------------------------------------------------
-
-class TestAliasCommands:
-
-    def test_alias_sub(self, tc):
-        tc.iadd("vsg", "dryrun")
-        tc.ilock("vsg")
-        tc.iinit("vsg")
-        assert tc.alias_set("freq", "SUB", "vsg:FREQ") is True
-        assert tc.alias_get("freq") == ("SUB", "vsg:FREQ")
-        val = tc.aread("freq")
-        assert val is not None
-        assert tc.awrite("freq", "1e9") is True
-
-    def test_alias_list_del(self, tc):
-        tc.alias_set("a1", "SUB", "x:Y")
-        tc.alias_set("a2", "SUB", "x:Z")
-        aliases = tc.alias_list()
-        assert "a1" in aliases and "a2" in aliases
-        assert tc.alias_del("a1") is True
-        assert "a1" not in tc.alias_list()
-
-    def test_noalias_error(self, tc):
-        with pytest.raises(NoAliasError):
-            tc.aread("nonexistent_alias")
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +351,7 @@ class TestEvents:
         received = []
 
         def listener():
-            for channel, payload in tc_sub.listen("__event:kv"):
+            for channel, payload in tc_sub.listen("kv"):
                 received.append((channel, payload))
                 if len(received) >= 2:
                     break
@@ -398,7 +366,7 @@ class TestEvents:
         t.join(timeout=3)
 
         assert len(received) == 2
-        assert received[0][0] == "__event:kv"
+        assert received[0][0] == "kv"
         assert received[0][1]["key"] == "meas:power"
         assert received[0][1]["value"] == "23.4"
         assert received[1][1]["key"] == "meas:freq"
@@ -420,7 +388,7 @@ class TestEvents:
 
         t = threading.Thread(
             target=tc_sub.subscribe,
-            args=("__event:kv",),
+            args=("kv",),
             kwargs={"callback": on_event},
             daemon=True,
         )
@@ -443,7 +411,7 @@ class TestEvents:
         received = []
 
         def listener():
-            for channel, payload in tc_sub.listen("__event:kv:alert:*"):
+            for channel, payload in tc_sub.listen("kv:alert:*"):
                 received.append(payload)
                 if len(received) >= 1:
                     break
@@ -505,11 +473,11 @@ class TestWorkflow:
         tc.iinit("meas")
 
         # Configure
-        tc.iwrite("gen", "FREQ", "900e6")
-        tc.iwrite("gen", "VOUT", "1.5")
+        tc.iwrite("gen FREQ", "900e6")
+        tc.iwrite("gen VOUT", "1.5")
 
         # Read measurement
-        reading = tc.iread("meas", "CH1")
+        reading = tc.iread("meas CH1")
         assert reading is not None
 
         # Store result
@@ -532,23 +500,6 @@ class TestWorkflow:
         # Cleanup
         tc.iunlock("gen", "meas")
 
-    def test_alias_workflow(self, tc):
-        """Test with aliases."""
-        tc.iadd("gen", "dryrun")
-        tc.ilock("gen")
-        tc.iinit("gen")
-
-        # Setup aliases (dryrun has FREQ, VOUT)
-        tc.alias_set("freq", "SUB", "gen:FREQ")
-        tc.alias_set("vout", "SUB", "gen:VOUT")
-
-        # Use aliases
-        tc.awrite("freq", "900e6")
-        tc.awrite("vout", "1.5")
-        freq_val = tc.aread("freq")
-        assert freq_val is not None
-
-        tc.iunlock("gen")
 
 
 # ---------------------------------------------------------------------------
@@ -648,9 +599,9 @@ class TestPipeline:
 
         # Read/write via pipeline
         with tc.pipeline() as pipe:
-            pipe.iwrite("pgen", "FREQ", "1e6")
-            pipe.iwrite("pgen", "VOUT", "2.0")
-            pipe.iread("pgen", "FREQ")
+            pipe.iwrite("pgen FREQ", "1e6")
+            pipe.iwrite("pgen VOUT", "2.0")
+            pipe.iread("pgen FREQ")
             results = pipe.execute()
 
         assert results[0] is True

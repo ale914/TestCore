@@ -24,10 +24,6 @@ class ReadOnlyError(CommandError):
     """Server returned -READONLY (reserved key prefix)."""
 
 
-class NoAliasError(CommandError):
-    """Server returned -NOALIAS (alias not found)."""
-
-
 class InstrumentError(TestCoreError):
     """Base for instrument-related errors."""
 
@@ -55,7 +51,6 @@ class DriverError(InstrumentError):
 # Prefix → exception class mapping
 _ERROR_MAP = {
     "READONLY": ReadOnlyError,
-    "NOALIAS": NoAliasError,
     "IDLE": IdleError,
     "LOCKED": LockedError,
     "NOTINIT": NotInitError,

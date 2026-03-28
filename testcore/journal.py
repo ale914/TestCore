@@ -30,6 +30,12 @@ class JournalEntry:
         name = self.client_name or f"session:{self.session_id}"
         return f"{ts} [{name}] {self.command} -> {self.status}"
 
+    def to_str_rel(self, prev_ts: float) -> str:
+        """Format with relative timestamp (delta from previous entry)."""
+        delta = self.timestamp - prev_ts
+        name = self.client_name or f"session:{self.session_id}"
+        return f"+{delta:.6f} [{name}] {self.command} -> {self.status}"
+
 
 class Journal:
     """Ring buffer of recent commands.

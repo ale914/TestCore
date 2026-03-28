@@ -376,5 +376,5 @@ class TestMonitorCommand:
         handler = make_mock_handler(1)
         handler.monitoring = True
         from testcore.commands import handle_subscribe
-        response = await handle_subscribe(["__event:kv"], ctx(1, handler))
+        response = await handle_subscribe(["kv"], ctx(1, handler))
         assert b'monitor mode' in response

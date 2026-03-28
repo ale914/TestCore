@@ -9,7 +9,7 @@ It is not a SCPI gateway. TestCore does not know or care what protocol your inst
 ```
  Client A (Python)          Client B (Dashboard)       Client C (CLI debug)
      │                           │                          │
-     │  IWRITE awg CH1:FREQ 1e9  │  SUBSCRIBE __event:kv    │  JOURNAL 20
+     │  IWRITE awg CH1:FREQ 1e9  │  SUBSCRIBE kv            │  JOURNAL 20
      │                           │                          │
      ▼                           ▼                          ▼
   ┌────────────────────────────────────────────────────────────┐
@@ -73,7 +73,7 @@ TestCore is infrastructure. It handles the problems that are the same on every b
 
 - **Shared state for coordination.** The KV store is a blackboard visible to all clients. A test script writes `KSET meas:freq:900 "-42.3"`, a dashboard reads it in real time via events, a post-processing script collects everything with `KGETALL meas:`. No file polling, no shared directories, no message queues.
 
-- **Real-time events.** `SUBSCRIBE __event:kv:meas:*` pushes every matching KSET to the subscriber instantly. Instrument state changes, lock transitions, client connects — all observable without polling.
+- **Real-time events.** `SUBSCRIBE kv:meas:*` pushes every matching KSET to the subscriber instantly. Instrument state changes, lock transitions, client connects — all observable without polling.
 
 - **Protocol-agnostic drivers.** A driver is a Python class with `read()`, `write()`, and `passthrough()`. It can talk SCPI over VISA, binary commands over serial, HTTP to a REST API, or anything else. TestCore doesn't care — it routes commands by resource name.
 
@@ -81,7 +81,7 @@ TestCore is infrastructure. It handles the problems that are the same on every b
 
 ### Concrete examples
 
-**Production test station** — A C# test executive locks five instruments, runs a calibration sequence, and stores 200 measurements per unit in the KV store. A Python script subscribes to `__event:kv` and streams results to a database in real time. An engineer connects with the CLI to inspect instrument state without interrupting the test. Three clients, one bench, no conflicts.
+**Production test station** — A C# test executive locks five instruments, runs a calibration sequence, and stores 200 measurements per unit in the KV store. A Python script subscribes to `kv` events and streams results to a database in real time. An engineer connects with the CLI to inspect instrument state without interrupting the test. Three clients, one bench, no conflicts.
 
 **Automated characterization** — A Python script sweeps 100 frequency points. At each point it configures the signal generator, reads four power sensors and two oscilloscopes with a single `IMREAD` call, and batch-stores all results with `KMSET`. The entire sweep runs through one TCP connection using pipeline batching — three round-trips instead of six hundred.
 
@@ -89,7 +89,7 @@ TestCore is infrastructure. It handles the problems that are the same on every b
 
 **New instrument, zero code** — You just received a multimeter with no TestCore driver. `IADD dmm generic_scpi TCPIP::192.168.1.50::5025` registers it with the passthrough-only SCPI driver. `IRAW dmm "MEAS:VOLT:DC?"` reads a voltage immediately. Write a proper driver with mapped resources later, when you need structured access.
 
-**Multi-team bench sharing** — The hardware team uses aliases (`ALIAS SET dut_voltage SUB psu:CH1:VOLTAGE`) to abstract the physical wiring. The software team writes tests using alias names. When the bench is rewired, only the alias definitions change — no test code modified.
+**Multi-team bench sharing** — The hardware team defines resource mappings as Python variables (`dut_voltage = "psu CH1:VOLTAGE"`). The software team writes tests using those names. When the bench is rewired, only the variable definitions change — no test code modified.
 
 ---
 
@@ -161,20 +161,20 @@ tc.kget("freq")                              # "1000"
 tc.iadd("awg", "agilent33500", "TCPIP0::192.168.1.50::inst0::INSTR")
 tc.ilock("awg")
 tc.iinit("awg")
-tc.iwrite("awg", "CH1:FREQ", 1000)
-tc.iread("awg", "CH1:FREQ")                  # "1000.0"
+tc.iwrite("awg CH1:FREQ", 1000)
+tc.iread("awg CH1:FREQ")                     # "1000.0"
 tc.iunlock("awg")
 
 # Pipeline (batch commands, single round-trip)
 with tc.pipeline() as pipe:
-    pipe.iwrite("awg", "CH1:FREQ", 900000000)
-    pipe.iwrite("awg", "CH1:AMPL", 2.5)
-    pipe.iwrite("awg", "CH1:OUTPUT", "ON")
+    pipe.iwrite("awg CH1:FREQ", 900000000)
+    pipe.iwrite("awg CH1:AMPL", 2.5)
+    pipe.iwrite("awg CH1:OUTPUT", "ON")
     results = pipe.execute()
 
 # Event subscription
-tc.subscribe("__event:kv:meas:*")            # KV changes matching glob
-tc.subscribe("__event:instrument")           # state transitions
+tc.subscribe("kv:meas:*")                    # KV changes matching glob
+tc.subscribe("instrument")                   # state transitions
 
 # Server introspection
 tc.dump()                                    # JSON snapshot of full state
@@ -182,6 +182,41 @@ tc.journal(20)                               # last 20 commands
 tc.kgetall("meas:")                          # all KV pairs with prefix
 
 tc.close()
+```
+
+### Pipeline
+
+The pipeline batches multiple commands into a single TCP round-trip. Commands are queued locally and sent together on `execute()`. This is critical for performance in measurement loops — 10 writes in one round-trip instead of 10 sequential ones.
+
+**Allowed in pipeline** — commands that do real work:
+
+| Category | Commands |
+|----------|----------|
+| KV store | `kset`, `kget`, `kmget`, `kmset`, `kdel`, `kexists`, `kkeys`, `kdbsize`, `kflush`, `kgetall` |
+| Instruments | `iadd`, `iremove`, `ilist`, `iinit`, `ireset`, `ialign`, `ilock`, `iunlock` |
+| Resource I/O | `iread`, `iwrite`, `iraw`, `imread`, `iload`, `isave` |
+| Measurements | `mget`, `mgetall`, `mkeys` |
+| Server | `ping` |
+
+**Blocked in pipeline** — introspection and streaming commands that don't belong in a batch:
+
+| Command | Reason |
+|---------|--------|
+| `DUMP`, `JOURNAL` | Large introspection snapshots |
+| `MONITOR`, `SUBSCRIBE`, `UNSUBSCRIBE` | Enter streaming mode |
+| `IINFO`, `IRESOURCES`, `ILOCKED` | Instrument introspection |
+| `DRIVER LIST` | Driver introspection |
+
+```python
+# Typical measurement loop with pipeline
+for freq in frequencies:
+    with tc.pipeline() as pipe:
+        pipe.iwrite("vsg CH1:FREQ", freq)
+        pipe.iread("pm POWER", meas=True)
+        pipe.iread("sa ACPR", meas=True)
+        pipe.kset(f"meas:{freq}:done", "1")
+        results = pipe.execute()
+    power, acpr = results[1], results[2]
 ```
 
 ---
@@ -227,7 +262,7 @@ testcore/
 ├── protocol.py          # RESP2 parser/serializer
 ├── store.py             # Key-value store with reserved prefixes
 ├── instruments.py       # Instrument registry, state machine
-├── commands.py          # Command dispatch table, all 46 handlers
+├── commands.py          # Command dispatch table, all 43 handlers
 ├── events.py            # EventBus pub/sub, event publishing helpers
 ├── journal.py           # Command journal ring buffer
 ├── base_driver.py       # BaseDriver ABC, ScpiDriver base, DriverError
@@ -245,7 +280,7 @@ cli/                     # Windows C CLI client
 ├── build.bat            # MinGW build script
 └── linenoise/           # Line editing library (BSD-2-Clause)
 
-tests/                   # 607 tests, 21 files, pytest
+tests/                   # 602 tests, 20 files, pytest
 ```
 
 ---
@@ -320,20 +355,21 @@ Client keys can be marked read-only with `KSET key value RO`. Only the creating 
 
 When server-side events occur, subscribed clients receive async RESP push messages. Clients subscribe via `SUBSCRIBE`. This is a minimal subset of Redis Pub/Sub — only server-generated events, no client-to-client messaging.
 
-| Channel                | Fires when                                                    |
-|------------------------|---------------------------------------------------------------|
-| `__event:instrument`   | Instrument state changes (ADD, REMOVE, INIT, FAULT, etc.)    |
-| `__event:lock`         | Lock acquired, released, or force-released                    |
-| `__event:session`      | Client connects or disconnects                                |
-| `__event:kv`           | KSET stores a value (key, value, session_id)                  |
-| `__event:kv:<glob>`    | KSET with key matching glob pattern (filtered server-side)    |
+| Channel              | Fires when                                                    |
+|----------------------|---------------------------------------------------------------|
+| `instrument`         | Instrument state changes (ADD, REMOVE, INIT, FAULT, etc.)    |
+| `lock`               | Lock acquired, released, or force-released                    |
+| `session`            | Client connects or disconnects                                |
+| `kv`                 | KSET stores a value (key, value, session_id)                  |
+| `kv:<glob>`          | KSET with key matching glob pattern (filtered server-side)    |
+| `meas`               | IMREAD/IREAD with MEAS flag stores a measurement result       |
 
 KV event filtering allows dashboard clients to react to specific changes without polling:
 
 ```
-SUBSCRIBE __event:kv              -- all KSET events
-SUBSCRIBE __event:kv:meas:*       -- only keys starting with "meas:"
-SUBSCRIBE __event:kv:alert:*      -- only keys starting with "alert:"
+SUBSCRIBE kv              -- all KSET events
+SUBSCRIBE kv:meas:*       -- only keys starting with "meas:"
+SUBSCRIBE kv:alert:*      -- only keys starting with "alert:"
 ```
 
 ### Session Management
@@ -344,13 +380,13 @@ Each TCP connection is a session with a sequential integer ID. On disconnect:
 2. Delete all session keys (`_sess:<id>:*`).
 3. Remove from MONITOR and SUBSCRIBE lists.
 4. Log disconnect to journal.
-5. Publish event on `__event:session`.
+5. Publish event on `session` channel.
 
 Hardware is never left in an undefined state after a client crash.
 
 ---
 
-## Command Reference (46 commands)
+## Command Reference (43 commands)
 
 ### Command Naming
 
@@ -364,8 +400,7 @@ Commands use **prefix-based naming** and **Redis-style subcommands**:
 | `DRIVER *` | Driver subcommands | `DRIVER LIST` |
 | `K*` | Key-Value store | `KSET`, `KGET`, `KDEL`, `KKEYS` |
 | `I*` | Instruments | `IADD`, `IREAD`, `ILOCK`, `ISAVE` |
-| `ALIAS *` | Alias subcommands | `ALIAS SET`, `ALIAS LIST` |
-| `A*` | Alias access | `AREAD`, `AWRITE` |
+| `M*` | Measurements | `MGET`, `MGETALL`, `MKEYS` |
 
 ### Server Commands
 
@@ -385,7 +420,7 @@ Returns `[unix_seconds, microseconds]`. Identical to Redis TIME.
 #### DUMP
 Returns JSON snapshot of the entire server state: KV store (excluding reserved prefixes), instruments, locks, sessions, version, timestamp.
 ```
-DUMP  →  $...\r\n{"version":"0.9.0","kv":{...},"instruments":{...},...}
+DUMP  →  $...\r\n{"version":"0.9.2","kv":{...},"instruments":{...},...}
 ```
 
 #### JOURNAL [count | +offset [count] | ALL | CLEAR]
@@ -426,8 +461,8 @@ MONITOR  →  +OK
 #### SUBSCRIBE channel [channel ...]
 Subscribes to event channels. Connection enters subscriber mode.
 ```
-SUBSCRIBE __event:instrument __event:lock
-SUBSCRIBE __event:kv:meas:*
+SUBSCRIBE instrument lock
+SUBSCRIBE kv:meas:*
 ```
 
 #### UNSUBSCRIBE [channel ...]
@@ -581,31 +616,61 @@ Releases all locks held by the current session.
 #### ILOCKED
 Returns all currently held locks with instrument name and owning session.
 
-### Alias Commands
+### Measurement Commands
 
-Aliases map human-readable names to instrument resources or raw commands. Test scripts use aliases; hardware details stay in configuration.
+The MEAS system provides structured, timestamped measurement storage separate from the general-purpose KV store. While `KSET` stores raw strings with no metadata, MEAS entries carry value, timestamp, and status — giving clients a reliable way to know *when* a reading was taken and *whether it is still valid*.
 
-#### ALIAS SET name type target
-Type is `SUB` (resource) or `RAW` (raw command string).
+#### How it works
+
+Any `IREAD` call with the `MEAS` flag stores the result as a MEAS entry alongside returning the value:
+
 ```
-ALIAS SET rf_power  SUB pm1:POWER
-ALIAS SET sa_acpr   RAW sa::CALC:ACPR:RES?
+IREAD awg CH1:FREQ MEAS    →  "1000000.0"   (also stored as MEAS entry)
+IREAD awg CH1:FREQ          →  "1000000.0"   (read-only, no storage)
 ```
 
-#### ALIAS GET name
-Returns `[type, target]`.
+Each MEAS entry contains:
+- **value** — the reading as a string (or null if the read failed)
+- **ts** — Unix timestamp of when the reading was taken
+- **status** — `OK`, `ERROR`, or `STALE`
 
-#### ALIAS DEL name
-Removes an alias.
+When an instrument is unlocked (`IUNLOCK`), all its MEAS entries are marked `STALE` — the hardware may change state, so previous readings are no longer trustworthy. Subscribers on the `meas` channel receive notifications for every MEAS write and invalidation.
 
-#### ALIAS LIST
-Returns all alias names.
+#### Use cases
 
-#### AREAD alias_name
-Reads through an alias. Resolves to `read()` for SUB, `passthrough()` for RAW. **Requires lock + READY.**
+**Dashboard with live readings** — A test script reads power and frequency with `MEAS` flag at each sweep point. A dashboard client subscribes to `meas` events and displays current values with timestamps. When the test finishes and unlocks the instruments, all readings flip to `STALE` — the dashboard greys them out automatically.
 
-#### AWRITE alias_name value
-Writes through a SUB alias. **Requires lock + READY.** RAW aliases don't support AWRITE.
+**Multi-instrument snapshot** — `IMREAD` with MEAS reads multiple resources in one call. All results are stored atomically with timestamps within milliseconds of each other:
+
+```python
+# Read four instruments in one round-trip, all stored as MEAS
+results = tc.imread("pm1 POWER", "pm2 POWER", "sa ACPR", "vsg CH1:FREQ", meas=True)
+
+# Later, retrieve stored results (from any client)
+tc.mgetall("pm1")    # {"pm1:POWER": {"value": "-42.3", "ts": 1706140800.1, "status": "OK"}}
+```
+
+**Post-test verification** — After a test run, `MGETALL` returns every measurement taken with its timestamp and status. A validation script can check that no readings are `STALE` or `ERROR` before accepting the results.
+
+#### MGET instrument resource
+Returns a single MEAS entry as JSON.
+```
+MGET pm1 POWER    →  {"value": "-42.3", "ts": 1706140800.123, "status": "OK"}
+```
+
+#### MGETALL [instrument]
+Returns all MEAS entries as flat array `[key1, json1, key2, json2, ...]`. Optional instrument filter.
+```
+MGETALL              →  ["pm1:POWER", "{...}", "sa:ACPR", "{...}"]
+MGETALL pm1          →  ["pm1:POWER", "{...}"]
+```
+
+#### MKEYS [instrument]
+Returns MEAS key names. Optional instrument filter.
+```
+MKEYS                →  ["pm1:POWER", "pm2:POWER", "sa:ACPR", "vsg:CH1:FREQ"]
+MKEYS pm1            →  ["pm1:POWER"]
+```
 
 ---
 
@@ -625,7 +690,6 @@ All errors are RESP error strings with a class prefix:
 | `FAULT`      | Instrument is UNRESPONSIVE/FAULT, requires IRESET                  |
 | `READONLY`   | Reserved key prefix, or key is RO and owned by another session     |
 | `NORESOURCE` | Instrument or resource does not exist                              |
-| `NOALIAS`    | Alias does not exist                                               |
 | `WRONGTYPE`  | Operation against wrong value type (e.g., KINCR on non-numeric)    |
 
 Examples:
@@ -739,7 +803,7 @@ Every driver method call is wrapped in `asyncio.to_thread()` + `asyncio.wait_for
 ## Running Tests
 
 ```bash
-python -m pytest tests/ -v          # 607 tests
+python -m pytest tests/ -v          # 602 tests
 python -m pytest tests/ --tb=short  # compact output
 python -m pytest tests/ -k "monitor"  # filter by name
 ```

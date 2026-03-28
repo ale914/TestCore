@@ -286,13 +286,13 @@ class InstrumentRegistry:
         inst.state = InstrumentState.LOCKED
         inst.resources = []
 
-    async def read(self, name: str, resource: str) -> str:
-        """Read resource value. Requires READY state."""
-        inst = self._get(name)
-        self._check_ready(inst)
+    async def _tracked_call(self, inst: Instrument, func, *args,
+                            timeout=None):
+        """Call driver method with timing, error tracking, and FAULT handling."""
         start = time.perf_counter()
         try:
-            result = await self._call_driver(inst, inst.driver.read, resource)
+            result = await self._call_driver(inst, func, *args,
+                                             timeout=timeout)
             inst.total_calls += 1
             inst.response_times.append(time.perf_counter() - start)
             return result
@@ -302,88 +302,49 @@ class InstrumentRegistry:
         except Exception as e:
             inst.total_errors += 1
             inst.state = InstrumentState.FAULT
-            logger.error(f"FAULT on {name}: {e}")
+            logger.error(f"FAULT on {inst.name}: {e}")
             raise DriverError(str(e))
+
+    async def read(self, name: str, resource: str) -> str:
+        """Read resource value. Requires READY state."""
+        inst = self._get(name)
+        self._check_ready(inst)
+        return await self._tracked_call(inst, inst.driver.read, resource)
 
     async def write(self, name: str, resource: str, value: str) -> None:
         """Write resource value. Requires READY state."""
         inst = self._get(name)
         self._check_ready(inst)
-        start = time.perf_counter()
-        try:
-            await self._call_driver(inst, inst.driver.write, resource, value)
-            inst.total_calls += 1
-            inst.response_times.append(time.perf_counter() - start)
-        except DriverError:
-            inst.total_errors += 1
-            raise
-        except Exception as e:
-            inst.total_errors += 1
-            inst.state = InstrumentState.FAULT
-            logger.error(f"FAULT on {name}: {e}")
-            raise DriverError(str(e))
+        await self._tracked_call(inst, inst.driver.write, resource, value)
 
     async def passthrough(self, name: str, command: str) -> str:
         """Raw command passthrough. Requires READY state."""
         inst = self._get(name)
         self._check_ready(inst)
-        start = time.perf_counter()
-        try:
-            result = await self._call_driver(
-                inst, inst.driver.passthrough, command)
-            inst.total_calls += 1
-            inst.response_times.append(time.perf_counter() - start)
-            return result
-        except DriverError:
-            inst.total_errors += 1
-            raise
-        except Exception as e:
-            inst.total_errors += 1
-            inst.state = InstrumentState.FAULT
-            logger.error(f"FAULT on {name}: {e}")
-            raise DriverError(str(e))
+        return await self._tracked_call(inst, inst.driver.passthrough, command)
 
     async def save(self, name: str, target: str, file_path: str) -> str:
         """Save data from instrument to file. Requires READY state."""
         inst = self._get(name)
         self._check_ready(inst)
-        start = time.perf_counter()
-        try:
-            result = await self._call_driver(
-                inst, inst.driver.save, target, file_path,
-                timeout=self._slow_timeout)
-            inst.total_calls += 1
-            inst.response_times.append(time.perf_counter() - start)
-            return result
-        except DriverError:
-            inst.total_errors += 1
-            raise
-        except Exception as e:
-            inst.total_errors += 1
-            inst.state = InstrumentState.FAULT
-            logger.error(f"FAULT on {name}: {e}")
-            raise DriverError(str(e))
+        return await self._tracked_call(
+            inst, inst.driver.save, target, file_path,
+            timeout=self._slow_timeout)
 
     async def load(self, name: str, target: str, file_path: str) -> str:
         """Load data from file into instrument. Requires READY state."""
         inst = self._get(name)
         self._check_ready(inst)
-        start = time.perf_counter()
-        try:
-            result = await self._call_driver(
-                inst, inst.driver.load, target, file_path,
-                timeout=self._slow_timeout)
-            inst.total_calls += 1
-            inst.response_times.append(time.perf_counter() - start)
-            return result
-        except DriverError:
-            inst.total_errors += 1
-            raise
-        except Exception as e:
-            inst.total_errors += 1
-            inst.state = InstrumentState.FAULT
-            logger.error(f"FAULT on {name}: {e}")
-            raise DriverError(str(e))
+        return await self._tracked_call(
+            inst, inst.driver.load, target, file_path,
+            timeout=self._slow_timeout)
+
+    async def ping(self, name: str) -> str:
+        """Send *IDN? to instrument. Works in any state except FAULT/UNRESPONSIVE."""
+        inst = self._get(name)
+        if inst.state in (InstrumentState.FAULT, InstrumentState.UNRESPONSIVE):
+            raise FaultError(f"{name} is {inst.state.value}")
+        return await self._call_driver(inst, inst.driver.passthrough, "*IDN?")
 
     def get(self, name: str) -> Instrument:
         """Get instrument by name."""

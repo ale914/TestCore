@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 import asyncio
+import fnmatch
 import json
+import logging
 import time
 from typing import Callable, Awaitable
 from .protocol import RESPSerializer
@@ -17,7 +19,7 @@ from .instruments import (
 from .base_driver import DriverError
 from .events import (
     publish_kv_event, publish_instrument_event, publish_lock_event,
-    get_event_bus, VALID_CHANNELS, is_valid_channel,
+    publish_meas_event, get_event_bus, VALID_CHANNELS, is_valid_channel,
 )
 from .journal import get_journal
 from . import __version__ as VERSION
@@ -38,13 +40,14 @@ class CommandDispatcher:
     def __init__(self):
         self._handlers: dict[str, CommandHandler] = {}
         self._dispatch_lock: asyncio.Lock | None = None
+        self._get_server = None  # cached lazy import
 
     def register(self, name: str, handler: CommandHandler):
         """Register a command handler."""
         self._handlers[name.upper()] = handler
 
     # Root words that take a subcommand (e.g. CLIENT ID, COMMAND LIST)
-    _SUBCOMMAND_ROOTS: set[str] = {"CLIENT", "COMMAND", "DRIVER", "ALIAS"}
+    _SUBCOMMAND_ROOTS: set[str] = {"CLIENT", "COMMAND", "DRIVER"}
 
     # Commands allowed in subscriber mode (spec §5.3)
     _SUBSCRIBER_ALLOWED: frozenset = frozenset({"SUBSCRIBE", "UNSUBSCRIBE", "PING"})
@@ -104,32 +107,26 @@ class CommandDispatcher:
                     f"command execution failed: {e}")
 
         # Record in journal (after execution, with result status)
-        journal = get_journal()
-        session_id = context.get("session_id", 0)
-        client_name = ""
         client_handler = context.get("client_handler")
-        if client_handler is not None:
-            client_name = getattr(client_handler, "name", "") or ""
+        session_id = context.get("session_id", 0)
+        client_name = (getattr(client_handler, "name", "") or ""
+                       ) if client_handler is not None else ""
         status = "error" if response[:1] == b"-" else "ok"
-        journal.record(session_id, client_name, command, status)
+        get_journal().record(session_id, client_name, command, status)
 
         # Broadcast to MONITOR clients (skip MONITOR itself, like Redis)
         if cmd_name != "MONITOR":
-            from .server import get_server
-            server = get_server()
+            if self._get_server is None:
+                from .server import get_server
+                self._get_server = get_server
+            server = self._get_server()
             if server and server.monitors:
-                sid = context.get("session_id", 0)
-                cname = getattr(client_handler, "name", "") or ""
-                label = f"{cname}#{sid}" if cname else f"#{sid}"
-                ts = time.time()
-                # TestCore MONITOR format: +timestamp [#id_or_name] "cmd" "arg1" ...
-                parts = [b"+", f"{ts:.6f} [{label}]".encode()]
-                for c in command:
-                    parts.append(b' "')
-                    parts.append(c.encode() if isinstance(c, str) else str(c).encode())
-                    parts.append(b'"')
-                parts.append(b"\r\n")
-                await server.broadcast_monitors(b"".join(parts))
+                label = f"{client_name}#{session_id}" if client_name \
+                    else f"#{session_id}"
+                cmd_str = " ".join(
+                    f'"{c}"' for c in command)
+                msg = f"+{time.time():.6f} [{label}] {cmd_str}\r\n"
+                await server.broadcast_monitors(msg.encode())
 
         return response
 
@@ -138,6 +135,20 @@ class CommandDispatcher:
 
 _OK_RESPONSE = b"+OK\r\n"
 _PONG_RESPONSE = b"+PONG\r\n"
+
+logger = logging.getLogger(__name__)
+
+
+def _session_id(context: dict | None) -> int | None:
+    return (context or {}).get("session_id")
+
+
+def _require_lock(inst, inst_name: str, session_id: int):
+    """Raise IdleError/LockedError if session doesn't hold the lock."""
+    if inst.lock_owner != session_id:
+        if inst.lock_owner is None:
+            raise IdleError(f"{inst_name} not locked")
+        raise LockedError(f"{inst_name} owned by session {inst.lock_owner}")
 
 
 async def handle_ping(args: list[str], context: dict = None) -> bytes:
@@ -160,8 +171,6 @@ async def handle_command(args: list[str], context: dict = None) -> bytes:
     COMMAND LIST          → *N\r\n...
     COMMAND LIST I*       → Filtered list
     """
-    import fnmatch
-
     pattern = args[0] if args else None
 
     # Get all commands
@@ -191,12 +200,17 @@ async def handle_set(args: list[str], context: dict = None) -> bytes:
         return RESPSerializer.error("wrong number of arguments for 'KSET' command")
 
     key, value = args[0], args[1]
-    flags = {a.upper() for a in args[2:]}
-    nx = 'NX' in flags
-    xx = 'XX' in flags
-    ro = 'RO' in flags
+    nx = xx = ro = False
+    for a in args[2:]:
+        f = a.upper()
+        if f == 'NX':
+            nx = True
+        elif f == 'XX':
+            xx = True
+        elif f == 'RO':
+            ro = True
 
-    session_id = (context or {}).get("session_id")
+    session_id = _session_id(context)
     store = get_store()
     try:
         success = store.set(key, value, nx=nx, xx=xx, ro=ro,
@@ -227,7 +241,7 @@ async def handle_get(args: list[str], context: dict = None) -> bytes:
     return RESPSerializer.bulk_string(value)
 
 
-async def handle_mget(args: list[str], context: dict = None) -> bytes:
+async def handle_kmget(args: list[str], context: dict = None) -> bytes:
     """
     Handle MGET key [key ...] command.
 
@@ -253,7 +267,7 @@ async def handle_mset(args: list[str], context: dict = None) -> bytes:
     # Parse key-value pairs
     pairs = [(args[i], args[i+1]) for i in range(0, len(args), 2)]
 
-    session_id = (context or {}).get("session_id")
+    session_id = _session_id(context)
     store = get_store()
     try:
         store.mset(pairs, session_id=session_id)
@@ -271,7 +285,7 @@ async def handle_del(args: list[str], context: dict = None) -> bytes:
     if len(args) < 1:
         return RESPSerializer.error("wrong number of arguments for 'KDEL' command")
 
-    session_id = (context or {}).get("session_id")
+    session_id = _session_id(context)
     store = get_store()
     try:
         count = store.delete(args, session_id=session_id)
@@ -325,7 +339,7 @@ async def handle_flushdb(args: list[str], context: dict = None) -> bytes:
 
     FLUSHDB  → +OK\r\n
     """
-    session_id = (context or {}).get("session_id")
+    session_id = _session_id(context)
     store = get_store()
     store.flushdb(session_id=session_id)
     return RESPSerializer.simple_string("OK")
@@ -346,6 +360,9 @@ async def handle_instrument_add(args: list[str], context: dict = None) -> bytes:
             "wrong number of arguments for 'IADD' command")
 
     name, driver_name = args[0], args[1]
+    if " " in name:
+        return RESPSerializer.error(
+            "instrument name must not contain spaces")
     address = None
     transport_opts = {}
 
@@ -471,6 +488,20 @@ async def handle_instrument_resources(args: list[str], context: dict = None) -> 
         return RESPSerializer.error(f"NORESOURCE {e}")
 
 
+async def handle_instrument_ping(args: list[str], context: dict = None) -> bytes:
+    """Handle IPING name. Send *IDN? without lock. Works in any state."""
+    if len(args) < 1:
+        return RESPSerializer.error(
+            "wrong number of arguments for 'IPING' command")
+
+    registry = get_registry()
+    try:
+        result = await registry.ping(args[0])
+        return RESPSerializer.bulk_string(result)
+    except (FaultError, DriverError) as e:
+        return _state_error(e)
+
+
 async def handle_instrument_reset(args: list[str], context: dict = None) -> bytes:
     """Handle INSTRUMENT.RESET name."""
     if len(args) < 1:
@@ -541,7 +572,7 @@ async def handle_lock(args: list[str], context: dict = None) -> bytes:
         return RESPSerializer.error(
             "wrong number of arguments for 'ILOCK' command")
 
-    session_id = (context or {}).get("session_id")
+    session_id = _session_id(context)
     if session_id is None:
         return RESPSerializer.error("no session context")
 
@@ -579,13 +610,25 @@ async def handle_lock(args: list[str], context: dict = None) -> bytes:
     return RESPSerializer.simple_string("OK")
 
 
+async def _unlock_with_meas(name: str, session_id: int, registry, store):
+    """Unlock instrument, invalidate MEAS, publish events."""
+    registry.unlock(name, session_id)
+    # Invalidate MEAS for this instrument and publish events
+    invalidated = store.invalidate_meas(name)
+    for inst_name, resource, meas in invalidated:
+        await publish_meas_event(inst_name, resource, meas.value, meas.ts, meas.status)
+    # Publish lock release event
+    await publish_lock_event("released", name, session_id)
+
+
 async def handle_unlock(args: list[str], context: dict = None) -> bytes:
     """Handle UNLOCK instrument [instrument ...] and UNLOCK ALL."""
-    session_id = (context or {}).get("session_id")
+    session_id = _session_id(context)
     if session_id is None:
         return RESPSerializer.error("no session context")
 
     registry = get_registry()
+    store = get_store()
 
     # UNLOCK ALL
     if args and args[0].upper() == "ALL":
@@ -593,9 +636,9 @@ async def handle_unlock(args: list[str], context: dict = None) -> bytes:
             inst = registry.get(name)
             if inst.lock_owner == session_id:
                 try:
-                    registry.unlock(name, session_id)
-                except Exception:
-                    pass
+                    await _unlock_with_meas(name, session_id, registry, store)
+                except Exception as e:
+                    logger.error(f"IUNLOCK ALL: failed to unlock {name}: {e}")
         return RESPSerializer.simple_string("OK")
 
     # UNLOCK instrument [instrument ...]
@@ -605,7 +648,7 @@ async def handle_unlock(args: list[str], context: dict = None) -> bytes:
 
     try:
         for name in args:
-            registry.unlock(name, session_id)
+            await _unlock_with_meas(name, session_id, registry, store)
         return RESPSerializer.simple_string("OK")
     except IdleError as e:
         return _state_error(e)
@@ -628,24 +671,51 @@ async def handle_locks(args: list[str], context: dict = None) -> bytes:
 
 # Resource Command Handlers (spec §6.4)
 
+async def _write_meas(inst_name: str, resource: str,
+                      value: str | None, error: Exception | None):
+    """Write MEAS entry and publish event. Called when MEAS flag is set."""
+    store = get_store()
+    if error is None:
+        status = "OK"
+    elif "timeout" in str(error).lower():
+        status = "TIMEOUT"
+    else:
+        status = f"ERROR {error}"
+        value = None
+    store.write_meas(inst_name, resource, value, status)
+    meas = store.get_meas(inst_name, resource)
+    await publish_meas_event(inst_name, resource, meas.value, meas.ts, meas.status)
+
+
 async def handle_read(args: list[str], context: dict = None) -> bytes:
-    """Handle READ instrument:resource or READ instrument resource."""
+    """Handle READ instrument resource [MEAS] or READ instrument:resource [MEAS]."""
     if len(args) < 1:
         return RESPSerializer.error(
             "wrong number of arguments for 'IREAD' command")
 
-    session_id = (context or {}).get("session_id")
+    session_id = _session_id(context)
     if session_id is None:
         return RESPSerializer.error("no session context")
 
+    # Detect MEAS flag (last arg, case-insensitive)
+    meas_flag = False
+    work_args = list(args)
+    if work_args and work_args[-1].upper() == "MEAS":
+        meas_flag = True
+        work_args.pop()
+
     # Accept both "instrument:resource" and "instrument resource"
-    if ":" in args[0]:
+    if not work_args:
+        return RESPSerializer.error(
+            "wrong number of arguments for 'IREAD' command")
+
+    if ":" in work_args[0]:
         try:
-            inst_name, resource = _parse_resource_address(args[0])
+            inst_name, resource = _parse_resource_address(work_args[0])
         except ValueError as e:
             return RESPSerializer.error(str(e))
-    elif len(args) >= 2:
-        inst_name, resource = args[0], args[1]
+    elif len(work_args) >= 2:
+        inst_name, resource = work_args[0], work_args[1]
     else:
         return RESPSerializer.error(
             "wrong number of arguments for 'IREAD' command")
@@ -653,13 +723,14 @@ async def handle_read(args: list[str], context: dict = None) -> bytes:
     registry = get_registry()
     try:
         inst = registry.get(inst_name)
-        if inst.lock_owner != session_id:
-            if inst.lock_owner is None:
-                raise IdleError(f"{inst_name} not locked")
-            raise LockedError(f"{inst_name} owned by session {inst.lock_owner}")
+        _require_lock(inst, inst_name, session_id)
         result = await registry.read(inst_name, resource)
+        if meas_flag:
+            await _write_meas(inst_name, resource, result, None)
         return RESPSerializer.bulk_string(result)
     except (IdleError, NotInitError, LockedError, FaultError, DriverError) as e:
+        if meas_flag and not isinstance(e, (IdleError, LockedError)):
+            await _write_meas(inst_name, resource, None, e)
         return _state_error(e)
 
 
@@ -669,7 +740,7 @@ async def handle_write(args: list[str], context: dict = None) -> bytes:
         return RESPSerializer.error(
             "wrong number of arguments for 'IWRITE' command")
 
-    session_id = (context or {}).get("session_id")
+    session_id = _session_id(context)
     if session_id is None:
         return RESPSerializer.error("no session context")
 
@@ -689,10 +760,7 @@ async def handle_write(args: list[str], context: dict = None) -> bytes:
     registry = get_registry()
     try:
         inst = registry.get(inst_name)
-        if inst.lock_owner != session_id:
-            if inst.lock_owner is None:
-                raise IdleError(f"{inst_name} not locked")
-            raise LockedError(f"{inst_name} owned by session {inst.lock_owner}")
+        _require_lock(inst, inst_name, session_id)
         await registry.write(inst_name, resource, value)
         return RESPSerializer.simple_string("OK")
     except (IdleError, NotInitError, LockedError, FaultError, DriverError) as e:
@@ -705,7 +773,7 @@ async def handle_raw(args: list[str], context: dict = None) -> bytes:
         return RESPSerializer.error(
             "wrong number of arguments for 'IRAW' command")
 
-    session_id = (context or {}).get("session_id")
+    session_id = _session_id(context)
     if session_id is None:
         return RESPSerializer.error("no session context")
 
@@ -715,10 +783,7 @@ async def handle_raw(args: list[str], context: dict = None) -> bytes:
     registry = get_registry()
     try:
         inst = registry.get(inst_name)
-        if inst.lock_owner != session_id:
-            if inst.lock_owner is None:
-                raise IdleError(f"{inst_name} not locked")
-            raise LockedError(f"{inst_name} owned by session {inst.lock_owner}")
+        _require_lock(inst, inst_name, session_id)
         result = await registry.passthrough(inst_name, command_str)
         return RESPSerializer.bulk_string(result)
     except (IdleError, NotInitError, LockedError, FaultError, DriverError) as e:
@@ -731,7 +796,7 @@ async def handle_readmulti(args: list[str], context: dict = None) -> bytes:
         return RESPSerializer.error(
             "wrong number of arguments for 'IMREAD' command")
 
-    session_id = (context or {}).get("session_id")
+    session_id = _session_id(context)
     if session_id is None:
         return RESPSerializer.error("no session context")
 
@@ -746,10 +811,7 @@ async def handle_readmulti(args: list[str], context: dict = None) -> bytes:
 
         try:
             inst = registry.get(inst_name)
-            if inst.lock_owner != session_id:
-                if inst.lock_owner is None:
-                    raise IdleError(f"{inst_name} not locked")
-                raise LockedError(f"{inst_name} owned by session {inst.lock_owner}")
+            _require_lock(inst, inst_name, session_id)
             result = await registry.read(inst_name, resource)
             results.append(result)
         except (IdleError, NotInitError, LockedError, FaultError, DriverError) as e:
@@ -773,7 +835,7 @@ async def handle_save(args: list[str], context: dict = None) -> bytes:
         return RESPSerializer.error(
             "wrong number of arguments for 'ISAVE' command")
 
-    session_id = (context or {}).get("session_id")
+    session_id = _session_id(context)
     if session_id is None:
         return RESPSerializer.error("no session context")
 
@@ -784,10 +846,7 @@ async def handle_save(args: list[str], context: dict = None) -> bytes:
     registry = get_registry()
     try:
         inst = registry.get(inst_name)
-        if inst.lock_owner != session_id:
-            if inst.lock_owner is None:
-                raise IdleError(f"{inst_name} not locked")
-            raise LockedError(f"{inst_name} owned by session {inst.lock_owner}")
+        _require_lock(inst, inst_name, session_id)
         result = await registry.save(inst_name, target, file_path)
         return RESPSerializer.bulk_string(result)
     except (IdleError, NotInitError, LockedError, FaultError, DriverError) as e:
@@ -808,7 +867,7 @@ async def handle_load(args: list[str], context: dict = None) -> bytes:
         return RESPSerializer.error(
             "wrong number of arguments for 'ILOAD' command")
 
-    session_id = (context or {}).get("session_id")
+    session_id = _session_id(context)
     if session_id is None:
         return RESPSerializer.error("no session context")
 
@@ -819,10 +878,7 @@ async def handle_load(args: list[str], context: dict = None) -> bytes:
     registry = get_registry()
     try:
         inst = registry.get(inst_name)
-        if inst.lock_owner != session_id:
-            if inst.lock_owner is None:
-                raise IdleError(f"{inst_name} not locked")
-            raise LockedError(f"{inst_name} owned by session {inst.lock_owner}")
+        _require_lock(inst, inst_name, session_id)
         result = await registry.load(inst_name, target, file_path)
         return RESPSerializer.bulk_string(result)
     except (IdleError, NotInitError, LockedError, FaultError, DriverError) as e:
@@ -947,7 +1003,7 @@ async def handle_time(args: list[str], context: dict = None) -> bytes:
 
 async def handle_clientid(args: list[str], context: dict = None) -> bytes:
     """Handle CLIENT ID — return current session ID."""
-    session_id = (context or {}).get("session_id")
+    session_id = _session_id(context)
     if session_id is None:
         return RESPSerializer.error("no session context")
     return RESPSerializer.integer(session_id)
@@ -1042,7 +1098,7 @@ async def handle_subscribe(args: list[str], context: dict = None) -> bytes:
             return RESPSerializer.error(
                 f"invalid channel '{channel}', "
                 f"valid: {', '.join(sorted(VALID_CHANNELS))} "
-                f"(__event:kv supports glob filter, e.g. __event:kv:alert:*)")
+                f"(supports glob filter, e.g. kv:alert:*)")
         bus.subscribe(client_handler, channel)
         # Redis SUBSCRIBE response: ["subscribe", channel, sub_count]
         total = len(bus.subscriber_channels(client_handler))
@@ -1095,190 +1151,13 @@ async def handle_unsubscribe(args: list[str], context: dict = None) -> bytes:
 
 # Alias System (spec §6.6)
 
-# In-memory alias store: name → (type, target)
-# type is "SUB" (resource address) or "RAW" (instrument::scpi_command)
-_aliases: dict[str, tuple[str, str]] = {}
 
-
-async def handle_alias_set(args: list[str], context: dict = None) -> bytes:
-    """Handle ALIAS.SET name type target.
-
-    ALIAS.SET rf_power SUB pm1:POWER
-    ALIAS.SET sa_pk2pk RAW sa::CALC:MARK1:Y?
-    """
-    if len(args) < 3:
-        return RESPSerializer.error(
-            "wrong number of arguments for 'ALIAS.SET' command")
-
-    name = args[0]
-    alias_type = args[1].upper()
-    target = args[2]
-
-    if alias_type not in ("SUB", "RAW"):
-        return RESPSerializer.error(
-            f"invalid alias type '{alias_type}', must be SUB or RAW")
-
-    # Validate target format
-    if alias_type == "SUB":
-        if ":" not in target:
-            return RESPSerializer.error(
-                "SUB alias target must be instrument:resource")
-    elif alias_type == "RAW":
-        if "::" not in target:
-            return RESPSerializer.error(
-                "RAW alias target must be instrument::scpi_command")
-
-    _aliases[name] = (alias_type, target)
-    return RESPSerializer.simple_string("OK")
-
-
-async def handle_alias_get(args: list[str], context: dict = None) -> bytes:
-    """Handle ALIAS.GET name — returns [type, target]."""
-    if len(args) < 1:
-        return RESPSerializer.error(
-            "wrong number of arguments for 'ALIAS.GET' command")
-
-    name = args[0]
-    alias = _aliases.get(name)
-    if alias is None:
-        return f"-NOALIAS alias '{name}' does not exist\r\n".encode()
-
-    return RESPSerializer.array([alias[0], alias[1]])
-
-
-async def handle_alias_del(args: list[str], context: dict = None) -> bytes:
-    """Handle ALIAS.DEL name — removes an alias."""
-    if len(args) < 1:
-        return RESPSerializer.error(
-            "wrong number of arguments for 'ALIAS.DEL' command")
-
-    name = args[0]
-    if name not in _aliases:
-        return f"-NOALIAS alias '{name}' does not exist\r\n".encode()
-
-    del _aliases[name]
-    return RESPSerializer.simple_string("OK")
-
-
-async def handle_alias_list(args: list[str], context: dict = None) -> bytes:
-    """Handle ALIAS.LIST — returns all alias names."""
-    return RESPSerializer.array(sorted(_aliases.keys()))
-
-
-async def handle_aread(args: list[str], context: dict = None) -> bytes:
-    """Handle AREAD alias_name — read through alias.
-
-    SUB alias → resolves to IREAD instrument:resource
-    RAW alias → resolves to IRAW instrument scpi_command
-    Requires lock ownership and READY state.
-    """
-    if len(args) < 1:
-        return RESPSerializer.error(
-            "wrong number of arguments for 'AREAD' command")
-
-    session_id = (context or {}).get("session_id")
-    if session_id is None:
-        return RESPSerializer.error("no session context")
-
-    alias_name = args[0]
-    alias = _aliases.get(alias_name)
-    if alias is None:
-        return f"-NOALIAS alias '{alias_name}' does not exist\r\n".encode()
-
-    alias_type, target = alias
-    registry = get_registry()
-
-    if alias_type == "SUB":
-        # target is "instrument:resource"
-        try:
-            inst_name, resource = _parse_resource_address(target)
-        except ValueError as e:
-            return RESPSerializer.error(str(e))
-
-        try:
-            inst = registry.get(inst_name)
-            if inst.lock_owner != session_id:
-                if inst.lock_owner is None:
-                    raise IdleError(f"{inst_name} not locked")
-                raise LockedError(
-                    f"{inst_name} owned by session {inst.lock_owner}")
-            result = await registry.read(inst_name, resource)
-            return RESPSerializer.bulk_string(result)
-        except (IdleError, NotInitError, LockedError, FaultError,
-                DriverError) as e:
-            return _state_error(e)
-
-    else:  # RAW
-        # target is "instrument::scpi_command"
-        parts = target.split("::", 1)
-        inst_name = parts[0]
-        scpi_cmd = parts[1] if len(parts) > 1 else ""
-
-        try:
-            inst = registry.get(inst_name)
-            if inst.lock_owner != session_id:
-                if inst.lock_owner is None:
-                    raise IdleError(f"{inst_name} not locked")
-                raise LockedError(
-                    f"{inst_name} owned by session {inst.lock_owner}")
-            result = await registry.passthrough(inst_name, scpi_cmd)
-            return RESPSerializer.bulk_string(result)
-        except (IdleError, NotInitError, LockedError, FaultError,
-                DriverError) as e:
-            return _state_error(e)
-
-
-async def handle_awrite(args: list[str], context: dict = None) -> bytes:
-    """Handle AWRITE alias_name value — write through SUB alias.
-
-    Only SUB aliases support AWRITE. RAW aliases are read-only.
-    Requires lock ownership and READY state.
-    """
-    if len(args) < 2:
-        return RESPSerializer.error(
-            "wrong number of arguments for 'AWRITE' command")
-
-    session_id = (context or {}).get("session_id")
-    if session_id is None:
-        return RESPSerializer.error("no session context")
-
-    alias_name = args[0]
-    value = args[1]
-
-    alias = _aliases.get(alias_name)
-    if alias is None:
-        return f"-NOALIAS alias '{alias_name}' does not exist\r\n".encode()
-
-    alias_type, target = alias
-
-    if alias_type != "SUB":
-        return RESPSerializer.error(
-            "AWRITE only supported for SUB aliases, not RAW")
-
-    try:
-        inst_name, resource = _parse_resource_address(target)
-    except ValueError as e:
-        return RESPSerializer.error(str(e))
-
-    registry = get_registry()
-    try:
-        inst = registry.get(inst_name)
-        if inst.lock_owner != session_id:
-            if inst.lock_owner is None:
-                raise IdleError(f"{inst_name} not locked")
-            raise LockedError(
-                f"{inst_name} owned by session {inst.lock_owner}")
-        await registry.write(inst_name, resource, value)
-        return RESPSerializer.simple_string("OK")
-    except (IdleError, NotInitError, LockedError, FaultError,
-            DriverError) as e:
-        return _state_error(e)
 
 
 # -- JOURNAL command (spec §6.1) --
 
 async def handle_journal(args: list[str], context: dict = None) -> bytes:
-    """Handle JOURNAL [count | +offset [count] | ALL | CLEAR] — tail-style.
+    """Handle JOURNAL [count | +offset [count] | ALL | CLEAR] [REL].
 
     JOURNAL           → last 10 entries
     JOURNAL 50        → last 50 entries
@@ -1287,8 +1166,15 @@ async def handle_journal(args: list[str], context: dict = None) -> bytes:
     JOURNAL +1 10     → first 10 entries
     JOURNAL ALL       → all entries
     JOURNAL CLEAR     → clear journal, return count cleared
+    JOURNAL 20 REL    → last 20 with relative timestamps (delta between commands)
     """
     journal = get_journal()
+
+    # Check for REL flag (last argument)
+    rel = False
+    if args and args[-1].upper() == "REL":
+        rel = True
+        args = args[:-1]
 
     if not args:
         entries = journal.tail(10)
@@ -1321,10 +1207,15 @@ async def handle_journal(args: list[str], context: dict = None) -> bytes:
                 return RESPSerializer.error("count must be positive")
         except ValueError:
             return RESPSerializer.error(
-                "usage: JOURNAL [count | +offset [count] | ALL | CLEAR]")
+                "usage: JOURNAL [count | +offset [count] | ALL | CLEAR] [REL]")
         entries = journal.tail(count)
 
-    # Return as array of formatted strings
+    # Format output
+    if rel and entries:
+        result = [entries[0].to_str_rel(entries[0].timestamp)]
+        for i in range(1, len(entries)):
+            result.append(entries[i].to_str_rel(entries[i - 1].timestamp))
+        return RESPSerializer.array(result)
     return RESPSerializer.array([e.to_str() for e in entries])
 
 
@@ -1426,6 +1317,52 @@ async def handle_getall(args: list[str], context: dict = None) -> bytes:
     return RESPSerializer.array(result)
 
 
+# -- MEAS commands --
+
+def _meas_to_json(meas) -> str:
+    """Serialize MeasValue to JSON string."""
+    return json.dumps({"value": meas.value, "ts": meas.ts, "status": meas.status},
+                      separators=(',', ':'))
+
+
+async def handle_meas_get(args: list[str], context: dict = None) -> bytes:
+    """Handle MGET instrument resource — read a single MEAS value."""
+    if len(args) < 2:
+        return RESPSerializer.error(
+            "wrong number of arguments for 'MGET' command")
+
+    store = get_store()
+    meas = store.get_meas(args[0], args[1])
+    if meas is None:
+        return RESPSerializer.null()
+    return RESPSerializer.bulk_string(_meas_to_json(meas))
+
+
+async def handle_meas_getall(args: list[str], context: dict = None) -> bytes:
+    """Handle MGETALL [instrument] — get all MEAS values.
+
+    Returns flat array [key1, json1, key2, json2, ...].
+    Keys are displayed without the '_meas:' prefix.
+    """
+    store = get_store()
+    instrument = args[0] if args else None
+    entries = store.get_all_meas(instrument)
+
+    result = []
+    for display_key, meas in entries:
+        result.append(display_key)
+        result.append(_meas_to_json(meas))
+    return RESPSerializer.array(result)
+
+
+async def handle_meas_keys(args: list[str], context: dict = None) -> bytes:
+    """Handle MKEYS [instrument] — list MEAS keys."""
+    store = get_store()
+    instrument = args[0] if args else None
+    keys = store.get_meas_keys(instrument)
+    return RESPSerializer.array(keys)
+
+
 # Global dispatcher instance
 dispatcher = CommandDispatcher()
 
@@ -1446,7 +1383,7 @@ dispatcher.register("JOURNAL", handle_journal)
 # Register KV commands (spec §6.2) — K prefix
 dispatcher.register("KSET", handle_set)
 dispatcher.register("KGET", handle_get)
-dispatcher.register("KMGET", handle_mget)
+dispatcher.register("KMGET", handle_kmget)
 dispatcher.register("KMSET", handle_mset)
 dispatcher.register("KDEL", handle_del)
 dispatcher.register("KEXISTS", handle_exists)
@@ -1462,6 +1399,7 @@ dispatcher.register("IINIT", handle_instrument_init)
 dispatcher.register("IINFO", handle_instrument_info)
 dispatcher.register("ILIST", handle_instrument_list)
 dispatcher.register("IRESOURCES", handle_instrument_resources)
+dispatcher.register("IPING", handle_instrument_ping)
 dispatcher.register("IRESET", handle_instrument_reset)
 dispatcher.register("IALIGN", handle_align)
 dispatcher.register("DRIVER LIST", handle_driver_list)
@@ -1479,10 +1417,8 @@ dispatcher.register("IMREAD", handle_readmulti)
 dispatcher.register("ILOAD", handle_load)
 dispatcher.register("ISAVE", handle_save)
 
-# Register alias commands (spec §6.6) — ALIAS subcommand + A prefix
-dispatcher.register("ALIAS SET", handle_alias_set)
-dispatcher.register("ALIAS GET", handle_alias_get)
-dispatcher.register("ALIAS DEL", handle_alias_del)
-dispatcher.register("ALIAS LIST", handle_alias_list)
-dispatcher.register("AREAD", handle_aread)
-dispatcher.register("AWRITE", handle_awrite)
+
+# Register MEAS commands
+dispatcher.register("MGET", handle_meas_get)
+dispatcher.register("MGETALL", handle_meas_getall)
+dispatcher.register("MKEYS", handle_meas_keys)

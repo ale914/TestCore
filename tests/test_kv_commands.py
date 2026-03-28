@@ -6,7 +6,7 @@
 
 import pytest
 from testcore.commands import (
-    handle_set, handle_get, handle_mget, handle_mset, handle_del,
+    handle_set, handle_get, handle_kmget, handle_mset, handle_del,
     handle_exists, handle_keys, handle_dbsize, handle_flushdb,
 )
 from testcore.store import get_store
@@ -114,7 +114,7 @@ class TestMGetCommand:
         await handle_set(['k2', 'v2'])
         await handle_set(['k3', 'v3'])
 
-        response = await handle_mget(['k1', 'k2', 'k3'])
+        response = await handle_kmget(['k1', 'k2', 'k3'])
         # Parse response
         parser = RESPParser()
         messages = parser.feed(response)
@@ -127,7 +127,7 @@ class TestMGetCommand:
         """Test MGET with some missing keys."""
         await handle_set(['k1', 'v1'])
 
-        response = await handle_mget(['k1', 'missing', 'k3'])
+        response = await handle_kmget(['k1', 'missing', 'k3'])
         parser = RESPParser()
         messages = parser.feed(response)
         result = messages[0]
@@ -137,7 +137,7 @@ class TestMGetCommand:
     @pytest.mark.asyncio
     async def test_mget_wrong_args(self):
         """Test MGET with no arguments."""
-        response = await handle_mget([])
+        response = await handle_kmget([])
         assert response.startswith(b'-ERR')
 
 

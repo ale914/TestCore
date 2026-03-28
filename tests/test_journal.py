@@ -256,6 +256,47 @@ class TestJournalCommand:
         assert entries[0].status == "error"
 
     @pytest.mark.asyncio
+    async def test_journal_rel_format(self, reset_journal):
+        """JOURNAL N REL returns relative timestamps."""
+        j = reset_journal
+        j.record(1, "", ["CMD1"], "ok")
+        j.record(1, "", ["CMD2"], "ok")
+        j.record(1, "", ["CMD3"], "ok")
+        response = await handle_journal(["3", "REL"], {})
+        parser = RESPParser()
+        result = parser.feed(response)[0]
+        assert len(result) == 3
+        # First entry shows +0.000000
+        assert result[0].startswith("+0.000000")
+        # Other entries show positive deltas
+        assert result[1].startswith("+")
+        assert result[2].startswith("+")
+
+    @pytest.mark.asyncio
+    async def test_journal_all_rel(self, reset_journal):
+        """JOURNAL ALL REL works."""
+        j = reset_journal
+        j.record(1, "", ["CMD1"], "ok")
+        j.record(1, "", ["CMD2"], "ok")
+        response = await handle_journal(["ALL", "REL"], {})
+        parser = RESPParser()
+        result = parser.feed(response)[0]
+        assert len(result) == 2
+        assert result[0].startswith("+0.000000")
+
+    @pytest.mark.asyncio
+    async def test_journal_rel_without_count(self, reset_journal):
+        """JOURNAL REL (no count) returns last 10 with relative timestamps."""
+        j = reset_journal
+        for i in range(3):
+            j.record(1, "", [f"CMD{i}"], "ok")
+        response = await handle_journal(["REL"], {})
+        parser = RESPParser()
+        result = parser.feed(response)[0]
+        assert len(result) == 3
+        assert result[0].startswith("+0.000000")
+
+    @pytest.mark.asyncio
     async def test_journal_registered(self):
         assert "JOURNAL" in dispatcher._handlers
 

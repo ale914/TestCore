@@ -23,10 +23,11 @@ from testcore.instruments import get_registry
 
 @pytest.fixture(autouse=True)
 def reset_state():
-    """Reset store, registry, event bus, and aliases before each test."""
+    """Reset store, registry, event bus before each test."""
     store = get_store()
     store._data.clear()
     store._owners.clear()
+    store._meas.clear()
     registry = get_registry()
     for name in list(registry._instruments.keys()):
         try:
@@ -37,9 +38,6 @@ def reset_state():
     # Reset event bus
     import testcore.events as events_mod
     events_mod._event_bus = None
-    # Reset aliases
-    from testcore.commands import _aliases
-    _aliases.clear()
 
 
 @pytest.fixture
@@ -1350,11 +1348,11 @@ class TestEventIntegration:
         sender = await Client.connect(server.test_port)
         try:
             # Subscribe to kv events
-            await subscriber.send(["SUBSCRIBE", "__event:kv"])
+            await subscriber.send(["SUBSCRIBE", "kv"])
             resp = await subscriber.read()
             assert isinstance(resp, list)
             assert resp[0] == "subscribe"
-            assert resp[1] == "__event:kv"
+            assert resp[1] == "kv"
 
             # Sender does KSET
             await sender.send(["KSET", "meas:power", "23.4"])
@@ -1365,7 +1363,7 @@ class TestEventIntegration:
             assert len(raw) > 0, "subscriber received no data after KSET"
             text = raw.decode("utf-8", errors="replace")
             assert "event" in text
-            assert "__event:kv" in text
+            assert "kv" in text
             assert "meas:power" in text
             assert "23.4" in text
         finally:
@@ -1378,7 +1376,7 @@ class TestEventIntegration:
         subscriber = await Client.connect(server.test_port)
         sender = await Client.connect(server.test_port)
         try:
-            await subscriber.send(["SUBSCRIBE", "__event:instrument"])
+            await subscriber.send(["SUBSCRIBE", "instrument"])
             resp = await subscriber.read()
             assert resp[0] == "subscribe"
 
@@ -1388,7 +1386,7 @@ class TestEventIntegration:
             raw = await subscriber.read_raw(timeout=2.0)
             assert len(raw) > 0, "subscriber received no data after IADD"
             text = raw.decode("utf-8", errors="replace")
-            assert "__event:instrument" in text
+            assert "instrument" in text
             assert "ADD" in text
             assert "dmm" in text
         finally:
@@ -1401,7 +1399,7 @@ class TestEventIntegration:
         subscriber = await Client.connect(server.test_port)
         operator = await Client.connect(server.test_port)
         try:
-            await subscriber.send(["SUBSCRIBE", "__event:lock"])
+            await subscriber.send(["SUBSCRIBE", "lock"])
             resp = await subscriber.read()
             assert resp[0] == "subscribe"
 
@@ -1414,7 +1412,7 @@ class TestEventIntegration:
             raw = await subscriber.read_raw(timeout=2.0)
             assert len(raw) > 0, "subscriber received no data after ILOCK"
             text = raw.decode("utf-8", errors="replace")
-            assert "__event:lock" in text
+            assert "lock" in text
             assert "acquired" in text
             assert "gen" in text
 
@@ -1430,7 +1428,7 @@ class TestEventIntegration:
         subscriber = await Client.connect(server.test_port)
         other = await Client.connect(server.test_port)
         try:
-            await subscriber.send(["SUBSCRIBE", "__event:session"])
+            await subscriber.send(["SUBSCRIBE", "session"])
             resp = await subscriber.read()
             assert resp[0] == "subscribe"
 
@@ -1448,7 +1446,7 @@ class TestEventIntegration:
             raw = await subscriber.read_raw(timeout=2.0)
             assert len(raw) > 0, "subscriber received no data after disconnect"
             text = raw.decode("utf-8", errors="replace")
-            assert "__event:session" in text
+            assert "session" in text
             assert "disconnect" in text
         finally:
             await subscriber.close()
@@ -1458,7 +1456,7 @@ class TestEventIntegration:
         """Client in subscriber mode cannot issue normal commands."""
         c = await Client.connect(server.test_port)
         try:
-            await c.send(["SUBSCRIBE", "__event:kv"])
+            await c.send(["SUBSCRIBE", "kv"])
             await c.read()
 
             await c.send(["KSET", "foo", "bar"])
@@ -1486,7 +1484,7 @@ class TestEventIntegration:
         subscriber = await Client.connect(server.test_port)
         sender = await Client.connect(server.test_port)
         try:
-            await subscriber.send(["SUBSCRIBE", "__event:kv"])
+            await subscriber.send(["SUBSCRIBE", "kv"])
             await subscriber.read()
 
             # Send 3 KSETs
@@ -1516,10 +1514,10 @@ class TestEventIntegration:
         subscriber = await Client.connect(server.test_port)
         sender = await Client.connect(server.test_port)
         try:
-            await subscriber.send(["SUBSCRIBE", "__event:kv:alert:*"])
+            await subscriber.send(["SUBSCRIBE", "kv:alert:*"])
             resp = await subscriber.read()
             assert resp[0] == "subscribe"
-            assert resp[1] == "__event:kv:alert:*"
+            assert resp[1] == "kv:alert:*"
 
             # Non-matching key — subscriber should NOT receive
             await sender.send(["KSET", "meas:power", "23.4"])
@@ -1548,11 +1546,11 @@ class TestEventIntegration:
         sub_meas = await Client.connect(server.test_port)
         sender = await Client.connect(server.test_port)
         try:
-            await sub_alert.send(["SUBSCRIBE", "__event:kv:alert:*"])
+            await sub_alert.send(["SUBSCRIBE", "kv:alert:*"])
             resp = await sub_alert.read()
             assert resp[0] == "subscribe"
 
-            await sub_meas.send(["SUBSCRIBE", "__event:kv:meas:*"])
+            await sub_meas.send(["SUBSCRIBE", "kv:meas:*"])
             resp = await sub_meas.read()
             assert resp[0] == "subscribe"
 
@@ -1579,138 +1577,6 @@ class TestEventIntegration:
             await sub_alert.close()
             await sub_meas.close()
             await sender.close()
-
-
-# ---------------------------------------------------------------------------
-# Alias system end-to-end
-# ---------------------------------------------------------------------------
-
-class TestAliasIntegration:
-    """Alias commands with real TCP connections."""
-
-    @pytest.mark.asyncio
-    async def test_alias_set_get_list_del(self, server):
-        c = await Client.connect(server.test_port)
-        try:
-            await c.send(["ALIAS", "SET", "rf_power", "SUB", "pm1:POWER"])
-            assert await c.read() == "OK"
-
-            await c.send(["ALIAS", "GET", "rf_power"])
-            resp = await c.read()
-            assert resp == ["SUB", "pm1:POWER"]
-
-            await c.send(["ALIAS", "LIST"])
-            resp = await c.read()
-            assert "rf_power" in resp
-
-            await c.send(["ALIAS", "DEL", "rf_power"])
-            assert await c.read() == "OK"
-
-            await c.send(["ALIAS", "LIST"])
-            resp = await c.read()
-            assert resp == []
-        finally:
-            await c.close()
-
-    @pytest.mark.asyncio
-    async def test_aread_through_sub_alias(self, server):
-        """AREAD resolves SUB alias to IREAD."""
-        c = await Client.connect(server.test_port)
-        try:
-            await c.send(["IADD", "vsg", "dryrun"])
-            assert await c.read() == "OK"
-            await c.send(["ILOCK", "vsg"])
-            assert await c.read() == "OK"
-            await c.send(["IINIT", "vsg"])
-            assert await c.read() == "OK"
-
-            await c.send(["ALIAS", "SET", "freq", "SUB", "vsg:FREQ"])
-            assert await c.read() == "OK"
-
-            await c.send(["AREAD", "freq"])
-            resp = await c.read()
-            assert resp is not None
-
-            await c.send(["IUNLOCK", "vsg"])
-            await c.read()
-        finally:
-            await c.close()
-
-    @pytest.mark.asyncio
-    async def test_awrite_through_sub_alias(self, server):
-        """AWRITE resolves SUB alias to IWRITE."""
-        c = await Client.connect(server.test_port)
-        try:
-            await c.send(["IADD", "vsg", "dryrun"])
-            assert await c.read() == "OK"
-            await c.send(["ILOCK", "vsg"])
-            assert await c.read() == "OK"
-            await c.send(["IINIT", "vsg"])
-            assert await c.read() == "OK"
-
-            await c.send(["ALIAS", "SET", "freq", "SUB", "vsg:FREQ"])
-            assert await c.read() == "OK"
-
-            await c.send(["AWRITE", "freq", "900e6"])
-            assert await c.read() == "OK"
-
-            # Verify the write went through
-            await c.send(["IREAD", "vsg:FREQ"])
-            assert await c.read() == "900e6"
-
-            await c.send(["IUNLOCK", "vsg"])
-            await c.read()
-        finally:
-            await c.close()
-
-    @pytest.mark.asyncio
-    async def test_aread_raw_alias(self, server):
-        """AREAD resolves RAW alias to IRAW passthrough."""
-        c = await Client.connect(server.test_port)
-        try:
-            await c.send(["IADD", "sa", "dryrun"])
-            assert await c.read() == "OK"
-            await c.send(["ILOCK", "sa"])
-            assert await c.read() == "OK"
-            await c.send(["IINIT", "sa"])
-            assert await c.read() == "OK"
-
-            await c.send(["ALIAS", "SET", "marker", "RAW", "sa::CALC:MARK1:Y?"])
-            assert await c.read() == "OK"
-
-            await c.send(["AREAD", "marker"])
-            resp = await c.read()
-            assert resp is not None
-
-            await c.send(["IUNLOCK", "sa"])
-            await c.read()
-        finally:
-            await c.close()
-
-    @pytest.mark.asyncio
-    async def test_awrite_raw_alias_rejected(self, server):
-        """AWRITE on RAW alias returns error."""
-        c = await Client.connect(server.test_port)
-        try:
-            await c.send(["ALIAS", "SET", "marker", "RAW", "sa::CALC:MARK1:Y?"])
-            assert await c.read() == "OK"
-
-            await c.send(["AWRITE", "marker", "0"])
-            resp = await c.read()
-            assert "ERR" in resp
-            assert "SUB" in resp
-        finally:
-            await c.close()
-
-    @pytest.mark.asyncio
-    async def test_aread_nonexistent_alias(self, server):
-        c = await Client.connect(server.test_port)
-        try:
-            await c.send(["AREAD", "ghost"])
-            resp = await c.read()
-            assert "NOALIAS" in resp
-        finally:
-            await c.close()
 
 
 class TestKVReadOnly:
@@ -1841,3 +1707,427 @@ class TestKVReadOnly:
         finally:
             await a.close()
             await b.close()
+
+
+# ---------------------------------------------------------------------------
+# MEAS tests
+# ---------------------------------------------------------------------------
+
+class TestMEAS:
+    """End-to-end tests for the MEAS type."""
+
+    async def _setup_instrument(self, client, name="sim"):
+        """Add, lock, and init a dryrun instrument."""
+        await client.send(["IADD", name, "dryrun"])
+        assert await client.read() == "OK"
+        await client.send(["ILOCK", name])
+        assert await client.read() == "OK"
+        await client.send(["IINIT", name])
+        assert await client.read() == "OK"
+
+    @pytest.mark.asyncio
+    async def test_iread_meas_writes_entry(self, server):
+        """IREAD with MEAS flag writes a MEAS entry readable via MGET."""
+        c = await Client.connect(server.test_port)
+        try:
+            await self._setup_instrument(c)
+
+            # IREAD with MEAS
+            await c.send(["IREAD", "sim", "VOUT", "MEAS"])
+            value = await c.read()
+            assert isinstance(value, str)  # dryrun returns a value
+
+            # MGET retrieves the MEAS
+            await c.send(["MGET", "sim", "VOUT"])
+            resp = await c.read()
+            import json
+            meas = json.loads(resp)
+            assert meas["status"] == "OK"
+            assert meas["value"] == value
+            assert "ts" in meas
+        finally:
+            await c.close()
+
+    @pytest.mark.asyncio
+    async def test_iread_without_meas_no_entry(self, server):
+        """IREAD without MEAS flag does not write a MEAS entry."""
+        c = await Client.connect(server.test_port)
+        try:
+            await self._setup_instrument(c)
+
+            await c.send(["IREAD", "sim", "VOUT"])
+            await c.read()
+
+            await c.send(["MGET", "sim", "VOUT"])
+            resp = await c.read()
+            assert resp is None  # nil
+        finally:
+            await c.close()
+
+    @pytest.mark.asyncio
+    async def test_mget_nonexistent(self, server):
+        """MGET for a non-existent MEAS returns nil."""
+        c = await Client.connect(server.test_port)
+        try:
+            await c.send(["MGET", "nosuch", "RES"])
+            resp = await c.read()
+            assert resp is None
+        finally:
+            await c.close()
+
+    @pytest.mark.asyncio
+    async def test_mgetall_and_mkeys(self, server):
+        """MGETALL and MKEYS return all MEAS entries."""
+        c = await Client.connect(server.test_port)
+        try:
+            await self._setup_instrument(c)
+
+            # Write two MEAS
+            await c.send(["IREAD", "sim", "VOUT", "MEAS"])
+            await c.read()
+            await c.send(["IREAD", "sim", "FREQ", "MEAS"])
+            await c.read()
+
+            # MKEYS
+            await c.send(["MKEYS"])
+            keys = await c.read()
+            assert isinstance(keys, list)
+            assert len(keys) == 2
+            assert "sim:VOUT" in keys
+            assert "sim:FREQ" in keys
+
+            # MGETALL
+            await c.send(["MGETALL"])
+            resp = await c.read()
+            assert isinstance(resp, list)
+            assert len(resp) == 4  # key, json, key, json
+
+            # MKEYS filtered by instrument
+            await c.send(["MKEYS", "sim"])
+            keys = await c.read()
+            assert len(keys) == 2
+
+            await c.send(["MKEYS", "nosuch"])
+            keys = await c.read()
+            assert keys == [] or keys is None
+        finally:
+            await c.close()
+
+    @pytest.mark.asyncio
+    async def test_mgetall_filter_by_instrument(self, server):
+        """MGETALL with instrument filter returns only that instrument's MEAS."""
+        c = await Client.connect(server.test_port)
+        try:
+            # Two instruments
+            await self._setup_instrument(c, "sim1")
+            await self._setup_instrument(c, "sim2")
+
+            await c.send(["IREAD", "sim1", "VOUT", "MEAS"])
+            await c.read()
+            await c.send(["IREAD", "sim2", "VOUT", "MEAS"])
+            await c.read()
+
+            # Filter by sim1
+            await c.send(["MGETALL", "sim1"])
+            resp = await c.read()
+            assert len(resp) == 2  # one key-value pair
+            assert resp[0] == "sim1:VOUT"
+        finally:
+            await c.close()
+
+    @pytest.mark.asyncio
+    async def test_meas_non_owner_can_read(self, server):
+        """A non-owner client can read MEAS via MGET."""
+        a = await Client.connect(server.test_port)
+        b = await Client.connect(server.test_port)
+        try:
+            await self._setup_instrument(a)
+
+            # Owner writes MEAS
+            await a.send(["IREAD", "sim", "VOUT", "MEAS"])
+            value = await a.read()
+
+            # Non-owner reads MEAS
+            await b.send(["MGET", "sim", "VOUT"])
+            resp = await b.read()
+            import json
+            meas = json.loads(resp)
+            assert meas["status"] == "OK"
+            assert meas["value"] == value
+        finally:
+            await a.close()
+            await b.close()
+
+    @pytest.mark.asyncio
+    async def test_meas_kset_blocked(self, server):
+        """Clients cannot KSET keys with _meas: prefix."""
+        c = await Client.connect(server.test_port)
+        try:
+            await c.send(["KSET", "_meas:fake:RES", "garbage"])
+            resp = await c.read()
+            assert "READONLY" in resp
+        finally:
+            await c.close()
+
+    @pytest.mark.asyncio
+    async def test_meas_stale_on_unlock(self, server):
+        """IUNLOCK marks MEAS as STALE, preserving last value."""
+        c = await Client.connect(server.test_port)
+        try:
+            await self._setup_instrument(c)
+
+            # Write MEAS
+            await c.send(["IREAD", "sim", "VOUT", "MEAS"])
+            value = await c.read()
+
+            # Unlock → MEAS becomes STALE
+            await c.send(["IUNLOCK", "sim"])
+            assert await c.read() == "OK"
+
+            # MGET returns STALE with last value
+            await c.send(["MGET", "sim", "VOUT"])
+            resp = await c.read()
+            import json
+            meas = json.loads(resp)
+            assert meas["status"] == "STALE"
+            assert meas["value"] == value  # value preserved
+        finally:
+            await c.close()
+
+    @pytest.mark.asyncio
+    async def test_meas_stale_on_unlock_all(self, server):
+        """IUNLOCK ALL marks all MEAS as STALE."""
+        c = await Client.connect(server.test_port)
+        try:
+            await self._setup_instrument(c, "sim1")
+            await self._setup_instrument(c, "sim2")
+
+            await c.send(["IREAD", "sim1", "VOUT", "MEAS"])
+            await c.read()
+            await c.send(["IREAD", "sim2", "VOUT", "MEAS"])
+            await c.read()
+
+            await c.send(["IUNLOCK", "ALL"])
+            assert await c.read() == "OK"
+
+            import json
+            await c.send(["MGET", "sim1", "VOUT"])
+            m1 = json.loads(await c.read())
+            assert m1["status"] == "STALE"
+
+            await c.send(["MGET", "sim2", "VOUT"])
+            m2 = json.loads(await c.read())
+            assert m2["status"] == "STALE"
+        finally:
+            await c.close()
+
+    @pytest.mark.asyncio
+    async def test_meas_stale_on_disconnect(self, server):
+        """Client disconnect marks MEAS as STALE."""
+        a = await Client.connect(server.test_port)
+        b = await Client.connect(server.test_port)
+        try:
+            await self._setup_instrument(a)
+
+            await a.send(["IREAD", "sim", "VOUT", "MEAS"])
+            value = await a.read()
+
+            # Owner disconnects
+            await a.close()
+            await asyncio.sleep(0.15)
+
+            # MEAS should be STALE
+            await b.send(["MGET", "sim", "VOUT"])
+            resp = await b.read()
+            import json
+            meas = json.loads(resp)
+            assert meas["status"] == "STALE"
+            assert meas["value"] == value
+        finally:
+            try:
+                await a.close()
+            except Exception:
+                pass
+            await b.close()
+
+    @pytest.mark.asyncio
+    async def test_meas_overwrite_after_relock(self, server):
+        """New owner can overwrite STALE MEAS with fresh reads."""
+        a = await Client.connect(server.test_port)
+        b = await Client.connect(server.test_port)
+        try:
+            await self._setup_instrument(a)
+
+            await a.send(["IREAD", "sim", "VOUT", "MEAS"])
+            await a.read()
+
+            # Unlock
+            await a.send(["IUNLOCK", "sim"])
+            await a.read()
+
+            # B locks and reads with MEAS
+            await b.send(["ILOCK", "sim"])
+            assert await b.read() == "OK"
+            await b.send(["IINIT", "sim"])
+            assert await b.read() == "OK"
+            await b.send(["IREAD", "sim", "VOUT", "MEAS"])
+            new_value = await b.read()
+
+            # MEAS should be OK with new value
+            await b.send(["MGET", "sim", "VOUT"])
+            resp = await b.read()
+            import json
+            meas = json.loads(resp)
+            assert meas["status"] == "OK"
+            assert meas["value"] == new_value
+        finally:
+            await a.close()
+            await b.close()
+
+    @pytest.mark.asyncio
+    async def test_meas_joined_syntax(self, server):
+        """IREAD with joined syntax (sim:VOUT) and MEAS flag works."""
+        c = await Client.connect(server.test_port)
+        try:
+            await self._setup_instrument(c)
+
+            await c.send(["IREAD", "sim:VOUT", "MEAS"])
+            value = await c.read()
+            assert isinstance(value, str)
+
+            await c.send(["MGET", "sim", "VOUT"])
+            resp = await c.read()
+            import json
+            meas = json.loads(resp)
+            assert meas["status"] == "OK"
+            assert meas["value"] == value
+        finally:
+            await c.close()
+
+    @pytest.mark.asyncio
+    async def test_meas_event_published(self, server):
+        """IREAD MEAS publishes event on __event:meas channel."""
+        owner = await Client.connect(server.test_port)
+        monitor = await Client.connect(server.test_port)
+        try:
+            await self._setup_instrument(owner)
+
+            # Subscribe to MEAS events
+            await monitor.send(["SUBSCRIBE", "meas"])
+            sub_resp = await monitor.read()
+            assert isinstance(sub_resp, list)  # ['subscribe', channel, count]
+
+            # Owner reads with MEAS
+            await owner.send(["IREAD", "sim", "VOUT", "MEAS"])
+            value = await owner.read()
+
+            # Monitor should receive the event
+            event = await monitor.read(timeout=2.0)
+            assert isinstance(event, list)
+            assert event[0] == "event"
+            assert event[1] == "meas"
+            import json
+            payload = json.loads(event[2])
+            assert payload["type"] == "meas"
+            assert payload["instrument"] == "sim"
+            assert payload["resource"] == "VOUT"
+            assert payload["status"] == "OK"
+            assert payload["value"] == value
+        finally:
+            await owner.close()
+            await monitor.close()
+
+    @pytest.mark.asyncio
+    async def test_meas_stale_event_on_unlock(self, server):
+        """IUNLOCK publishes STALE events on __event:meas."""
+        owner = await Client.connect(server.test_port)
+        monitor = await Client.connect(server.test_port)
+        try:
+            await self._setup_instrument(owner)
+
+            await owner.send(["IREAD", "sim", "VOUT", "MEAS"])
+            await owner.read()
+
+            # Subscribe to MEAS events
+            await monitor.send(["SUBSCRIBE", "meas"])
+            await monitor.read()  # subscribe confirmation
+
+            # Unlock → STALE event
+            await owner.send(["IUNLOCK", "sim"])
+            await owner.read()
+
+            event = await monitor.read(timeout=2.0)
+            assert isinstance(event, list)
+            import json
+            payload = json.loads(event[2])
+            assert payload["status"] == "STALE"
+            assert payload["instrument"] == "sim"
+        finally:
+            await owner.close()
+            await monitor.close()
+
+    @pytest.mark.asyncio
+    async def test_meas_event_filtered(self, server):
+        """Glob-filtered subscription on __event:meas works."""
+        owner = await Client.connect(server.test_port)
+        monitor = await Client.connect(server.test_port)
+        try:
+            await self._setup_instrument(owner, "sim1")
+            await self._setup_instrument(owner, "sim2")
+
+            # Subscribe only to sim1 events
+            await monitor.send(["SUBSCRIBE", "meas:sim1:*"])
+            await monitor.read()
+
+            # Read from sim2 with MEAS (should NOT trigger event)
+            await owner.send(["IREAD", "sim2", "VOUT", "MEAS"])
+            await owner.read()
+
+            # Read from sim1 with MEAS (should trigger event)
+            await owner.send(["IREAD", "sim1", "VOUT", "MEAS"])
+            await owner.read()
+
+            # Monitor should receive only sim1 event
+            event = await monitor.read(timeout=2.0)
+            import json
+            payload = json.loads(event[2])
+            assert payload["instrument"] == "sim1"
+        finally:
+            await owner.close()
+            await monitor.close()
+
+    @pytest.mark.asyncio
+    async def test_mget_wrong_args(self, server):
+        """MGET with wrong number of args returns error."""
+        c = await Client.connect(server.test_port)
+        try:
+            await c.send(["MGET", "onlyone"])
+            resp = await c.read()
+            assert "ERR" in resp
+        finally:
+            await c.close()
+
+    @pytest.mark.asyncio
+    async def test_lock_event_on_unlock(self, server):
+        """IUNLOCK now publishes lock release event (gap fix)."""
+        owner = await Client.connect(server.test_port)
+        monitor = await Client.connect(server.test_port)
+        try:
+            await self._setup_instrument(owner)
+
+            # Subscribe to lock events
+            await monitor.send(["SUBSCRIBE", "lock"])
+            await monitor.read()
+
+            await owner.send(["IUNLOCK", "sim"])
+            await owner.read()
+
+            event = await monitor.read(timeout=2.0)
+            assert isinstance(event, list)
+            import json
+            payload = json.loads(event[2])
+            assert payload["type"] == "released"
+            assert payload["instrument"] == "sim"
+        finally:
+            await owner.close()
+            await monitor.close()
