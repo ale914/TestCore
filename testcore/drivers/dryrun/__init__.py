@@ -70,6 +70,9 @@ class DryRunDriver(BaseDriver):
         else:
             raise DriverError(f"unknown save target: {target}")
 
+    def wait_complete(self):
+        pass  # no-op: simulated instrument is always "complete"
+
     def passthrough(self, command):
         return f"DRYRUN_ECHO: {command}"
 

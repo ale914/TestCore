@@ -72,6 +72,14 @@ Examples:
     )
 
     parser.add_argument(
+        '--parallel',
+        action='store_true',
+        default=False,
+        help='Per-instrument locking: commands on different instruments '
+             'run concurrently (default: global serial dispatch)'
+    )
+
+    parser.add_argument(
         '--loglevel',
         choices=['debug', 'info', 'warning', 'error'],
         default='info',
@@ -100,6 +108,12 @@ def main():
     from .journal import get_journal
     get_journal(maxlen=args.journal_size)
     logger.info(f"Journal size: {args.journal_size}")
+
+    # Configure dispatch mode
+    if args.parallel:
+        from .commands import dispatcher
+        dispatcher.set_parallel(True)
+        logger.info("Dispatch mode: parallel (per-instrument locking)")
 
     try:
         asyncio.run(run_server(args.bind, args.port, args.max_clients))

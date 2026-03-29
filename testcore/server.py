@@ -330,6 +330,10 @@ class TestCoreServer:
         if self.clients:
             await asyncio.gather(*self.clients.values(), return_exceptions=True)
 
+        # Stop health monitoring tasks
+        from .health import get_health_monitor
+        get_health_monitor().stop_all()
+
         # Belt-and-suspenders: safe_state + disconnect ALL instruments
         # regardless of lock state (covers edge cases where client cleanup
         # failed or instruments were added without locks)

@@ -128,6 +128,15 @@ class BaseDriver(ABC):
         """
 
     @abstractmethod
+    def wait_complete(self) -> None:
+        """Block until all pending operations are complete.
+
+        Called on IWAIT. SCPI instruments use *OPC?; other instrument
+        types implement their own mechanism.
+        Must not raise under normal conditions.
+        """
+
+    @abstractmethod
     def safe_state(self) -> None:
         """Put instrument in safe/idle state.
 
@@ -214,6 +223,10 @@ class ScpiDriver(BaseDriver):
     def error(self) -> str:
         """SYST:ERR? — Query next error from the error queue."""
         return self._query("SYST:ERR?")
+
+    def wait_complete(self) -> None:
+        """*OPC? — block until all pending operations complete."""
+        self.opc()
 
     # -- BaseDriver contract: default SCPI implementations --
 

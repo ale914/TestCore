@@ -31,16 +31,62 @@ CommandHandler = Callable[[list[str], dict], Awaitable[bytes]]
 class CommandDispatcher:
     """Scalable command dispatch table.
 
-    Dispatch is serial (one command at a time) via a global asyncio lock,
-    matching the Redis single-threaded model. Driver I/O is offloaded to
-    threads with a watchdog timeout (spec §7.4) but the dispatch lock
-    ensures only one command is in flight at any time.
+    Two locking modes controlled by set_parallel():
+    - Global (default): single asyncio.Lock serializes all commands (Redis model)
+    - Parallel (--parallel): per-instrument locks, commands on different
+      instruments run concurrently. Non-instrument commands run lock-free.
     """
+
+    # Commands that target instrument(s) extracted from args
+    # Maps command name → extraction method name
+    _SINGLE_INSTRUMENT = frozenset({
+        "IINIT", "IINFO", "IRESOURCES", "IPING", "IWAIT", "IRESET",
+        "IREAD", "IWRITE", "IRAW", "ILOAD", "ISAVE",
+    })
+    _MULTI_INSTRUMENT = frozenset({"ILOCK", "IALIGN", "IMREAD"})
+    _REGISTRY_COMMANDS = frozenset({"IADD", "IREMOVE"})
 
     def __init__(self):
         self._handlers: dict[str, CommandHandler] = {}
         self._dispatch_lock: asyncio.Lock | None = None
+        self._parallel: bool = False
+        self._instrument_locks: dict[str, asyncio.Lock] = {}
+        self._registry_lock: asyncio.Lock | None = None
         self._get_server = None  # cached lazy import
+
+    def set_parallel(self, enabled: bool) -> None:
+        """Enable per-instrument locking. Must be called before first dispatch."""
+        self._parallel = enabled
+
+    def _get_instrument_lock(self, name: str) -> asyncio.Lock:
+        """Get or create a lock for an instrument."""
+        if name not in self._instrument_locks:
+            self._instrument_locks[name] = asyncio.Lock()
+        return self._instrument_locks[name]
+
+    def remove_instrument_lock(self, name: str) -> None:
+        """Clean up lock when instrument is removed."""
+        self._instrument_locks.pop(name, None)
+
+    def _extract_instruments(self, cmd_name: str, args: list[str]) -> list[str]:
+        """Extract instrument name(s) from command args for per-instrument locking."""
+        if not args:
+            return []
+
+        if cmd_name in self._SINGLE_INSTRUMENT:
+            # First arg is instrument or instrument:resource
+            return [args[0].split(":")[0]]
+
+        if cmd_name in self._MULTI_INSTRUMENT:
+            # All args are instruments or instrument:resource pairs
+            return list(dict.fromkeys(a.split(":")[0] for a in args))
+
+        if cmd_name == "IUNLOCK":
+            if args[0].upper() == "ALL":
+                return []  # uses registry lock
+            return [a.split(":")[0] for a in args]
+
+        return []
 
     def register(self, name: str, handler: CommandHandler):
         """Register a command handler."""
@@ -95,16 +141,19 @@ class CommandDispatcher:
             return RESPSerializer.error(
                 "only SUBSCRIBE, UNSUBSCRIBE, PING allowed in subscriber mode")
 
-        # Lazy init: asyncio.Lock() requires a running event loop
-        if self._dispatch_lock is None:
-            self._dispatch_lock = asyncio.Lock()
-
-        async with self._dispatch_lock:
-            try:
-                response = await handler(args, context)
-            except Exception as e:
-                response = RESPSerializer.error(
-                    f"command execution failed: {e}")
+        # Execute with appropriate locking
+        if self._parallel:
+            response = await self._dispatch_parallel(cmd_name, args, handler, context)
+        else:
+            # Global lock (default mode)
+            if self._dispatch_lock is None:
+                self._dispatch_lock = asyncio.Lock()
+            async with self._dispatch_lock:
+                try:
+                    response = await handler(args, context)
+                except Exception as e:
+                    response = RESPSerializer.error(
+                        f"command execution failed: {e}")
 
         # Record in journal (after execution, with result status)
         client_handler = context.get("client_handler")
@@ -129,6 +178,46 @@ class CommandDispatcher:
                 await server.broadcast_monitors(msg.encode())
 
         return response
+
+    async def _dispatch_parallel(self, cmd_name: str, args: list[str],
+                                  handler, context: dict) -> bytes:
+        """Dispatch with per-instrument locking."""
+        # Registry commands (IADD/IREMOVE) use registry lock
+        if cmd_name in self._REGISTRY_COMMANDS or (
+                cmd_name == "IUNLOCK" and args and args[0].upper() == "ALL"):
+            if self._registry_lock is None:
+                self._registry_lock = asyncio.Lock()
+            async with self._registry_lock:
+                try:
+                    return await handler(args, context)
+                except Exception as e:
+                    return RESPSerializer.error(
+                        f"command execution failed: {e}")
+
+        # Instrument commands — acquire per-instrument lock(s)
+        instruments = self._extract_instruments(cmd_name, args)
+        if not instruments:
+            # Non-instrument command (PING, KSET, etc.) — no lock needed
+            try:
+                return await handler(args, context)
+            except Exception as e:
+                return RESPSerializer.error(
+                    f"command execution failed: {e}")
+
+        # Acquire locks in sorted order to prevent deadlock
+        sorted_names = sorted(set(instruments))
+        locks = [self._get_instrument_lock(n) for n in sorted_names]
+
+        for lock in locks:
+            await lock.acquire()
+        try:
+            return await handler(args, context)
+        except Exception as e:
+            return RESPSerializer.error(
+                f"command execution failed: {e}")
+        finally:
+            for lock in reversed(locks):
+                lock.release()
 
 
 # Command Handlers
@@ -384,10 +473,22 @@ async def handle_instrument_add(args: list[str], context: dict = None) -> bytes:
             return RESPSerializer.error(
                 "unexpected argument, use key=value for transport options")
 
+    # Extract health parameter (not a transport option)
+    health_interval = transport_opts.pop("health", None)
+    if health_interval is not None:
+        if not isinstance(health_interval, (int, float)) or \
+                health_interval < 1 or health_interval > 100:
+            return RESPSerializer.error(
+                "health interval must be 1-100 seconds")
+
     registry = get_registry()
     try:
-        registry.add(name, driver_name, address,
-                     transport_opts=transport_opts or None)
+        inst = registry.add(name, driver_name, address,
+                            transport_opts=transport_opts or None)
+        if health_interval is not None:
+            inst.health_interval = float(health_interval)
+            from .health import get_health_monitor
+            get_health_monitor().start(inst)
         await publish_instrument_event("ADD", name, driver=driver_name)
         return RESPSerializer.simple_string("OK")
     except DriverError as e:
@@ -400,9 +501,13 @@ async def handle_instrument_remove(args: list[str], context: dict = None) -> byt
         return RESPSerializer.error(
             "wrong number of arguments for 'IREMOVE' command")
 
+    from .health import get_health_monitor
+    get_health_monitor().stop(args[0])
+
     registry = get_registry()
     try:
         registry.remove(args[0])
+        dispatcher.remove_instrument_lock(args[0])
         await publish_instrument_event("REMOVE", args[0])
         return RESPSerializer.simple_string("OK")
     except DriverError as e:
@@ -460,6 +565,13 @@ async def handle_instrument_info(args: list[str], context: dict = None) -> bytes
         for k, v in driver_info.items():
             lines.append(f"{k}:{v}")
 
+        if inst.health_interval is not None:
+            import time as _time
+            ago = _time.monotonic() - inst.last_call_ok
+            lines.append(f"health_interval:{inst.health_interval:.0f}s")
+            lines.append(f"health_failures:{inst.health_failures}")
+            lines.append(f"health_last_ok:{ago:.1f}s ago")
+
         return RESPSerializer.bulk_string("\r\n".join(lines))
     except DriverError as e:
         return RESPSerializer.error(f"NORESOURCE {e}")
@@ -499,6 +611,25 @@ async def handle_instrument_ping(args: list[str], context: dict = None) -> bytes
         result = await registry.ping(args[0])
         return RESPSerializer.bulk_string(result)
     except (FaultError, DriverError) as e:
+        return _state_error(e)
+
+
+async def handle_instrument_wait(args: list[str], context: dict = None) -> bytes:
+    """Handle IWAIT name — wait for pending operations to complete (*OPC?)."""
+    if len(args) < 1:
+        return RESPSerializer.error(
+            "wrong number of arguments for 'IWAIT' command")
+
+    name = args[0]
+    session_id = _session_id(context)
+    registry = get_registry()
+
+    try:
+        inst = registry.get(name)
+        _require_lock(inst, name, session_id)
+        await registry.wait_complete(name)
+        return RESPSerializer.simple_string("OK")
+    except (IdleError, NotInitError, LockedError, FaultError, DriverError) as e:
         return _state_error(e)
 
 
@@ -1326,13 +1457,14 @@ def _meas_to_json(meas) -> str:
 
 
 async def handle_meas_get(args: list[str], context: dict = None) -> bytes:
-    """Handle MGET instrument resource — read a single MEAS value."""
-    if len(args) < 2:
+    """Handle MGET instrument:resource."""
+    if len(args) < 1 or ":" not in args[0]:
         return RESPSerializer.error(
             "wrong number of arguments for 'MGET' command")
 
+    instrument, resource = args[0].split(":", 1)
     store = get_store()
-    meas = store.get_meas(args[0], args[1])
+    meas = store.get_meas(instrument, resource)
     if meas is None:
         return RESPSerializer.null()
     return RESPSerializer.bulk_string(_meas_to_json(meas))
@@ -1400,6 +1532,7 @@ dispatcher.register("IINFO", handle_instrument_info)
 dispatcher.register("ILIST", handle_instrument_list)
 dispatcher.register("IRESOURCES", handle_instrument_resources)
 dispatcher.register("IPING", handle_instrument_ping)
+dispatcher.register("IWAIT", handle_instrument_wait)
 dispatcher.register("IRESET", handle_instrument_reset)
 dispatcher.register("IALIGN", handle_align)
 dispatcher.register("DRIVER LIST", handle_driver_list)

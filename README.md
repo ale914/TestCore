@@ -49,7 +49,7 @@ Five rules. No exceptions.
 
 3. **In-memory, volatile by design.** All state lives in RAM. Persistence is the client's responsibility. `DUMP` exports a JSON snapshot. This is a live test tool, not a database.
 
-4. **Single-threaded command dispatch.** Connections are concurrent (asyncio), but command execution is serial from a single dispatch loop. No race conditions by design. Driver calls are offloaded to a thread executor with a watchdog timeout.
+4. **Single-threaded command dispatch by default.** Connections are concurrent (asyncio), but command execution is serial from a single dispatch loop. No race conditions by design. Driver calls are offloaded to a thread executor with a watchdog timeout. For multi-instrument benches, `--parallel` enables per-instrument locking so commands on different instruments run concurrently.
 
 5. **Safety as a first-class primitive.** `IUNLOCK` and client disconnect trigger `safe_state()` on hardware — outputs off, reset to defaults. The server ensures instruments are never left in an undefined state, even after a client crash.
 
@@ -109,6 +109,7 @@ python -m testcore --bind 0.0.0.0             # listen on all interfaces
 python -m testcore --driver-timeout 10        # 10s watchdog for driver calls
 python -m testcore --max-clients 32           # limit connections
 python -m testcore --journal-size 5000        # journal ring buffer size
+python -m testcore --parallel                 # per-instrument locking (see below)
 python -m testcore --loglevel debug           # verbose logging
 ```
 
@@ -159,10 +160,13 @@ tc.kget("freq")                              # "1000"
 
 # Instrument workflow
 tc.iadd("awg", "agilent33500", "TCPIP0::192.168.1.50::inst0::INSTR")
+tc.iadd("psu", "keysight_e36xx", "TCPIP::192.168.1.20::5025", health=10)  # ping every 10s
 tc.ilock("awg")
 tc.iinit("awg")
-tc.iwrite("awg CH1:FREQ", 1000)
-tc.iread("awg CH1:FREQ")                     # "1000.0"
+tc.iwrite("awg CH1:FREQ", 1000000000)
+tc.iwrite("awg CH1:OUTPUT", "ON")
+tc.iwait("awg")                              # wait for *OPC? (operation complete)
+tc.iread("awg CH1:FREQ")                     # "1000000000.0"
 tc.iunlock("awg")
 
 # Pipeline (batch commands, single round-trip)
@@ -250,7 +254,9 @@ The event loop processes one command at a time. Driver calls are executed via `a
 
 ### Concurrency Model
 
-TestCore uses `asyncio`. The TCP server accepts connections concurrently. Each connection has its own read buffer and RESP parser. Parsed commands are dispatched sequentially from the event loop. This is the Redis model: I/O is multiplexed, execution is serial. No race conditions by design.
+TestCore uses `asyncio`. The TCP server accepts connections concurrently. Each connection has its own read buffer and RESP parser. Parsed commands are dispatched sequentially from the event loop by default — the Redis model: I/O is multiplexed, execution is serial.
+
+With `--parallel`, a per-instrument lock replaces the global dispatch lock. Commands targeting different instruments run concurrently. Commands on the same instrument remain serialized. Non-instrument commands (PING, KSET, etc.) run lock-free. IADD/IREMOVE use a separate registry lock.
 
 ### Project Structure
 
@@ -262,7 +268,8 @@ testcore/
 ├── protocol.py          # RESP2 parser/serializer
 ├── store.py             # Key-value store with reserved prefixes
 ├── instruments.py       # Instrument registry, state machine
-├── commands.py          # Command dispatch table, all 43 handlers
+├── commands.py          # Command dispatch table, all 48 handlers
+├── health.py            # HealthMonitor singleton, per-instrument ping tasks
 ├── events.py            # EventBus pub/sub, event publishing helpers
 ├── journal.py           # Command journal ring buffer
 ├── base_driver.py       # BaseDriver ABC, ScpiDriver base, DriverError
@@ -280,7 +287,7 @@ cli/                     # Windows C CLI client
 ├── build.bat            # MinGW build script
 └── linenoise/           # Line editing library (BSD-2-Clause)
 
-tests/                   # 602 tests, 20 files, pytest
+tests/                   # 656 tests, 23 files, pytest
 ```
 
 ---
@@ -386,7 +393,7 @@ Hardware is never left in an undefined state after a client crash.
 
 ---
 
-## Command Reference (43 commands)
+## Command Reference (48 commands)
 
 ### Command Naming
 
@@ -423,7 +430,7 @@ Returns JSON snapshot of the entire server state: KV store (excluding reserved p
 DUMP  →  $...\r\n{"version":"0.9.2","kv":{...},"instruments":{...},...}
 ```
 
-#### JOURNAL [count | +offset [count] | ALL | CLEAR]
+#### JOURNAL [count | +offset [count] | ALL | CLEAR | REL]
 Returns entries from the command ring buffer. Tail-style syntax:
 ```
 JOURNAL            →  last 100 entries (default)
@@ -432,6 +439,7 @@ JOURNAL +50        →  from entry 50 onward
 JOURNAL +50 10     →  10 entries starting at offset 50
 JOURNAL ALL        →  all entries in buffer
 JOURNAL CLEAR      →  clear the ring buffer
+JOURNAL REL        →  last 100 entries with relative timestamps (delta between consecutive commands)
 ```
 
 #### CLIENT ID
@@ -525,10 +533,27 @@ Address routing (handled by TestCore transport layer):
 - Raw TCP (`host:port`) → socket
 - Serial (`COM*`, `/dev/tty*`) → pyserial
 
+Optional `key=value` parameters are passed to the transport layer (e.g., `baudrate=115200`). The special parameter `health=N` enables background health monitoring (see Health Monitoring below).
+
 ```
-IADD awg  agilent33500 TCPIP0::192.168.1.10::inst0::INSTR  →  +OK
-IADD smu  keithley2400 COM3 baudrate=115200                  →  +OK
-IADD sim  dryrun                                              →  +OK
+IADD awg  agilent33500 TCPIP0::192.168.1.10::inst0::INSTR           →  +OK
+IADD psu  keysight_e36xx TCPIP::192.168.1.20::5025 health=10        →  +OK  (ping every 10s)
+IADD smu  keithley2400 COM3 baudrate=115200                          →  +OK
+IADD sim  dryrun                                                      →  +OK
+```
+
+#### Health Monitoring
+
+When `health=N` is passed to `IADD`, the server starts a background task that pings the instrument every N seconds (minimum 1, maximum 100). The ping is skipped if:
+- The instrument is in `FAULT` or `UNRESPONSIVE` state
+- The instrument is currently busy processing a command
+- The instrument was active within the last N seconds
+
+If 3 consecutive pings fail, the instrument transitions to `UNRESPONSIVE` and an event is published on the `instrument` channel — identical to the transition that occurs on driver timeout during IREAD/IWRITE.
+
+Health status is visible in `IINFO` output:
+```
+IINFO psu  →  ... health_interval: 10  health_failures: 0 ...
 ```
 
 #### IREMOVE name
@@ -543,7 +568,7 @@ IINIT awg TST                      →  +OK  (with self-test)
 ```
 
 #### IINFO name
-Returns instrument metadata: name, driver, state, resource count, lock owner, call stats, and driver info (vendor, model, serial).
+Returns instrument metadata: name, driver, state, resource count, lock owner, call stats, and driver info (vendor, model, serial). If health monitoring is active, also includes `health_interval` and `health_failures`.
 
 #### ILIST
 Returns array of all instrument names.
@@ -562,18 +587,18 @@ Returns array of registered driver module names.
 
 ### Resource Access Commands
 
-#### IREAD instrument resource
-Reads current value from hardware. **Requires lock + READY.**
+#### IREAD instrument resource [MEAS]
+Reads current value from hardware. **Requires lock + READY.** The `MEAS` flag stores the result as a timestamped measurement entry (see Measurement Commands).
 ```
-IREAD awg CH1:FREQ     →  "1000000.0"
-IREAD psu VOLTAGE       →  "3.300"
+IREAD awg CH1:FREQ          →  "1000000.0"
+IREAD psu VOLTAGE MEAS      →  "3.300"       (with MEAS storage)
 ```
 
 #### IWRITE instrument resource value
 Writes a value. **Requires lock + READY.**
 ```
 IWRITE awg CH1:FREQ 900e6    →  +OK
-IWRITE psu VOLTAGE 3.3       →  +OK
+IWRITE psu VOLTAGE 3.3        →  +OK
 ```
 
 #### IRAW instrument command_string
@@ -597,6 +622,20 @@ ILOAD awg CH1:MyWave ./waveforms/pulse.csv  →  "1024 points loaded"
 
 #### ISAVE instrument target file_path
 Saves data from instrument to file. Driver-specific.
+
+#### IPING name
+Sends `*IDN?` to the instrument and returns the response. Works in any state except `FAULT`/`UNRESPONSIVE`. Does not require a lock. Useful for checking connectivity without acquiring ownership.
+```
+IPING awg  →  "Agilent Technologies,33522A,MY50000001,3.05"
+```
+
+#### IWAIT name
+Waits for the instrument to complete all pending operations. **Requires lock + READY.** Calls `*OPC?` on the instrument and blocks until it returns `1`. Used after operations that may complete asynchronously (burst sequences, sweep completion, arbitrary waveform playback).
+```
+IWRITE awg CH1:BURS_NCYC 1000
+IWAIT awg              →  +OK  (blocks until burst complete)
+IREAD awg CH1:FREQ     →  "1000000.0"
+```
 
 ### Lock Commands
 
@@ -652,10 +691,10 @@ tc.mgetall("pm1")    # {"pm1:POWER": {"value": "-42.3", "ts": 1706140800.1, "sta
 
 **Post-test verification** — After a test run, `MGETALL` returns every measurement taken with its timestamp and status. A validation script can check that no readings are `STALE` or `ERROR` before accepting the results.
 
-#### MGET instrument resource
-Returns a single MEAS entry as JSON.
+#### MGET instrument:resource
+Returns a single MEAS entry as JSON. Format is `instrument:resource` (colon-separated, matching `MKEYS` output).
 ```
-MGET pm1 POWER    →  {"value": "-42.3", "ts": 1706140800.123, "status": "OK"}
+MGET pm1:POWER    →  {"value": "-42.3", "ts": 1706140800.123, "status": "OK"}
 ```
 
 #### MGETALL [instrument]
@@ -713,6 +752,7 @@ Command-line arguments:
 | `driver_timeout` | `5.0`       | `--driver-timeout` | Watchdog timeout for driver calls (s)   |
 | `journal_size`   | `1000`      | `--journal-size`  | Ring buffer entries                      |
 | `max_clients`    | `64`        | `--max-clients`   | Maximum simultaneous connections         |
+| `parallel`       | `false`     | `--parallel`      | Per-instrument locking (see Concurrency Model) |
 | `loglevel`       | `info`      | `--loglevel`      | Logging verbosity                        |
 
 ### Reliability
@@ -768,6 +808,10 @@ class MyInstrumentDriver(BaseDriver):
         """Put instrument in safe/idle state. Called on IUNLOCK, disconnect,
         and before IREMOVE. Must not raise."""
 
+    def wait_complete(self) -> None:
+        """Block until all pending operations complete (*OPC?). Called on IWAIT.
+        ScpiDriver provides a default implementation via self.opc()."""
+
     def info(self) -> dict:
         """Return metadata: vendor, model, serial, version."""
 ```
@@ -803,7 +847,7 @@ Every driver method call is wrapped in `asyncio.to_thread()` + `asyncio.wait_for
 ## Running Tests
 
 ```bash
-python -m pytest tests/ -v          # 602 tests
+python -m pytest tests/ -v          # 656 tests
 python -m pytest tests/ --tb=short  # compact output
 python -m pytest tests/ -k "monitor"  # filter by name
 ```

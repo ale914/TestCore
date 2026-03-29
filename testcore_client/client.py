@@ -210,15 +210,14 @@ class TestCore:
     # MEAS commands
     # ------------------------------------------------------------------
 
-    def mget(self, target: str) -> dict | None:
-        """MGET instrument resource. Returns parsed MEAS dict or None.
+    def mget(self, key: str) -> dict | None:
+        """MGET instrument:resource. Returns parsed MEAS dict or None.
 
         Example:
-            tc.mget("sensor1 TEMP")
+            tc.mget("sensor1:TEMP")
             # -> {"value": "72.3", "ts": 1706140800.123, "status": "OK"}
         """
-        instrument, resource = target.split(" ", 1)
-        r = self._cmd("MGET", instrument, resource)
+        r = self._cmd("MGET", key)
         if r is None:
             return None
         return json.loads(r)
@@ -332,6 +331,10 @@ class TestCore:
         """IPING name. Send *IDN? without lock. Returns IDN string."""
         return self._cmd("IPING", name)
 
+    def iwait(self, name: str) -> None:
+        """IWAIT name. Wait for pending operations to complete (*OPC?)."""
+        self._cmd("IWAIT", name)
+
     def driver_list(self) -> list[str]:
         """DRIVER LIST. Returns list of loaded drivers."""
         r = self._cmd("DRIVER", "LIST")
@@ -388,6 +391,11 @@ class TestCore:
     def ireset(self, name: str) -> bool:
         """IRESET name. Reset instrument. Returns True."""
         r = self._cmd("IRESET", name)
+        return r == "OK"
+
+    def iwait(self, name: str) -> bool:
+        """IWAIT name. Wait for pending operations (*OPC?). Returns True."""
+        r = self._cmd("IWAIT", name)
         return r == "OK"
 
     def ialign(self, *names: str) -> bool:
@@ -794,18 +802,21 @@ class Pipeline:
     def ireset(self, name: str) -> Pipeline:
         return self._queue(self._parse_ok, "IRESET", name)
 
+    def iwait(self, name: str) -> Pipeline:
+        return self._queue(self._parse_ok, "IWAIT", name)
+
     def ialign(self, *names: str) -> Pipeline:
         return self._queue(self._parse_ok, "IALIGN", *names)
 
     # -- MEAS commands ---
 
-    def mget(self, target: str) -> Pipeline:
-        instrument, resource = target.split(" ", 1)
+    def mget(self, key: str) -> Pipeline:
+        """MGET instrument:resource."""
         def parse(r):
             if r is None:
                 return None
             return json.loads(r)
-        return self._queue(parse, "MGET", instrument, resource)
+        return self._queue(parse, "MGET", key)
 
     def mgetall(self, instrument: str | None = None) -> Pipeline:
         args = ["MGETALL"]

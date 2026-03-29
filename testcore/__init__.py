@@ -4,7 +4,7 @@
 
 """TestCore - Command server for test hardware."""
 
-__version__ = "0.9.2"
+__version__ = "0.9.3"
 
 from .base_driver import BaseDriver, ScpiDriver, DriverError
 

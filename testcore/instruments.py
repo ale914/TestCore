@@ -47,6 +47,10 @@ class Instrument:
     total_calls: int = 0
     total_errors: int = 0
     response_times: collections.deque = field(default=None)
+    health_interval: float | None = None
+    health_failures: int = 0
+    last_call_ok: float = field(default_factory=time.monotonic)
+    _busy: bool = field(default=False, repr=False)
 
     def __post_init__(self):
         if self.response_times is None:
@@ -220,19 +224,28 @@ class InstrumentRegistry:
             timeout: Override timeout in seconds. Defaults to _driver_timeout.
         """
         t = timeout if timeout is not None else self._driver_timeout
+        inst._busy = True
         try:
-            return await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 asyncio.to_thread(func, *args),
                 timeout=t,
             )
+            inst.last_call_ok = time.monotonic()
+            return result
         except asyncio.TimeoutError:
             inst.state = InstrumentState.UNRESPONSIVE
             inst.total_errors += 1
             logger.error(
                 f"Driver timeout on {inst.name}: "
                 f"{func.__name__}() exceeded {t}s → UNRESPONSIVE")
+            from .events import publish_instrument_event
+            asyncio.create_task(
+                publish_instrument_event("UNRESPONSIVE", inst.name,
+                                         reason="driver_timeout"))
             raise DriverError(
                 f"driver timeout ({t}s) → UNRESPONSIVE")
+        finally:
+            inst._busy = False
 
     async def init_instrument(self, name: str,
                               config_path: str | None = None,
@@ -303,6 +316,10 @@ class InstrumentRegistry:
             inst.total_errors += 1
             inst.state = InstrumentState.FAULT
             logger.error(f"FAULT on {inst.name}: {e}")
+            from .events import publish_instrument_event
+            asyncio.create_task(
+                publish_instrument_event("FAULT", inst.name,
+                                         reason=str(e)))
             raise DriverError(str(e))
 
     async def read(self, name: str, resource: str) -> str:
@@ -338,6 +355,13 @@ class InstrumentRegistry:
         return await self._tracked_call(
             inst, inst.driver.load, target, file_path,
             timeout=self._slow_timeout)
+
+    async def wait_complete(self, name: str) -> None:
+        """Wait for pending operations to complete (IWAIT). Requires READY state."""
+        inst = self._get(name)
+        self._check_ready(inst)
+        await self._tracked_call(inst, inst.driver.wait_complete,
+                                 timeout=self._slow_timeout)
 
     async def ping(self, name: str) -> str:
         """Send *IDN? to instrument. Works in any state except FAULT/UNRESPONSIVE."""

@@ -9,8 +9,8 @@ import pytest
 from testcore.commands import (
     handle_instrument_add, handle_instrument_remove, handle_instrument_init,
     handle_instrument_info, handle_instrument_list, handle_instrument_resources,
-    handle_instrument_ping, handle_instrument_reset, handle_align,
-    handle_driver_list
+    handle_instrument_ping, handle_instrument_wait, handle_instrument_reset,
+    handle_align, handle_driver_list
 )
 from testcore.instruments import get_registry, InstrumentState
 from testcore.protocol import RESPParser
@@ -321,4 +321,65 @@ class TestInstrumentPingCommand:
     async def test_ping_wrong_args(self):
         """IPING with no args returns error."""
         response = await handle_instrument_ping([])
+        assert response.startswith(b'-ERR')
+
+
+class TestInstrumentWaitCommand:
+    """Tests for IWAIT command — wait for pending operations (*OPC?)."""
+
+    @pytest.mark.asyncio
+    async def test_wait_ready(self):
+        """IWAIT works on READY instrument."""
+        await add_and_lock("vsg", ["FREQ"])
+        await handle_instrument_init(["vsg"])
+        response = await handle_instrument_wait(
+            ["vsg"], {"session_id": SESSION_1})
+        assert response == b'+OK\r\n'
+
+    @pytest.mark.asyncio
+    async def test_wait_on_idle_returns_error(self):
+        """IWAIT on IDLE instrument returns error."""
+        await handle_instrument_add(["vsg", DRYRUN_PATH])
+        response = await handle_instrument_wait(
+            ["vsg"], {"session_id": SESSION_1})
+        assert b'-IDLE' in response
+
+    @pytest.mark.asyncio
+    async def test_wait_on_locked_returns_error(self):
+        """IWAIT on LOCKED (not initialized) returns NOTINIT error."""
+        await add_and_lock("vsg", ["FREQ"])
+        response = await handle_instrument_wait(
+            ["vsg"], {"session_id": SESSION_1})
+        assert b'-NOTINIT' in response
+
+    @pytest.mark.asyncio
+    async def test_wait_wrong_owner_returns_error(self):
+        """IWAIT by non-owner returns LOCKED error."""
+        await add_and_lock("vsg", ["FREQ"])
+        await handle_instrument_init(["vsg"])
+        response = await handle_instrument_wait(
+            ["vsg"], {"session_id": 999})
+        assert b'-LOCKED' in response
+
+    @pytest.mark.asyncio
+    async def test_wait_fault_returns_error(self):
+        """IWAIT on FAULT instrument returns error."""
+        await add_and_lock("vsg", ["FREQ"])
+        inst = get_registry().get("vsg")
+        inst.state = InstrumentState.FAULT
+        response = await handle_instrument_wait(
+            ["vsg"], {"session_id": SESSION_1})
+        assert b'-FAULT' in response
+
+    @pytest.mark.asyncio
+    async def test_wait_nonexistent(self):
+        """IWAIT on unknown instrument returns error."""
+        response = await handle_instrument_wait(
+            ["nonexistent"], {"session_id": SESSION_1})
+        assert response.startswith(b'-')
+
+    @pytest.mark.asyncio
+    async def test_wait_wrong_args(self):
+        """IWAIT with no args returns error."""
+        response = await handle_instrument_wait([], {})
         assert response.startswith(b'-ERR')
