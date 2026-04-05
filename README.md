@@ -49,7 +49,7 @@ Five rules. No exceptions.
 
 3. **In-memory, volatile by design.** All state lives in RAM. Persistence is the client's responsibility. `DUMP` exports a JSON snapshot. This is a live test tool, not a database.
 
-4. **Single-threaded command dispatch by default.** Connections are concurrent (asyncio), but command execution is serial from a single dispatch loop. No race conditions by design. Driver calls are offloaded to a thread executor with a watchdog timeout. For multi-instrument benches, `--parallel` enables per-instrument locking so commands on different instruments run concurrently.
+4. **Single-threaded command dispatch.** Connections are concurrent (asyncio), but command execution is serial from a single dispatch loop. No race conditions by design. Driver calls are offloaded to a thread executor with a watchdog timeout. Transport-level concurrency (IMREAD, health pings, watch guards) is handled by a per-instrument lock inside `_call_driver()`, not the dispatch layer.
 
 5. **Safety as a first-class primitive.** `IUNLOCK` and client disconnect trigger `safe_state()` on hardware — outputs off, reset to defaults. The server ensures instruments are never left in an undefined state, even after a client crash.
 
@@ -109,8 +109,8 @@ python -m testcore --bind 0.0.0.0             # listen on all interfaces
 python -m testcore --driver-timeout 10        # 10s watchdog for driver calls
 python -m testcore --max-clients 32           # limit connections
 python -m testcore --journal-size 5000        # journal ring buffer size
-python -m testcore --parallel                 # per-instrument locking (see below)
 python -m testcore --loglevel debug           # verbose logging
+python -m testcore --bench bench.cfg          # load instruments at startup
 ```
 
 ### Interactive session
@@ -256,7 +256,7 @@ The event loop processes one command at a time. Driver calls are executed via `a
 
 TestCore uses `asyncio`. The TCP server accepts connections concurrently. Each connection has its own read buffer and RESP parser. Parsed commands are dispatched sequentially from the event loop by default — the Redis model: I/O is multiplexed, execution is serial.
 
-With `--parallel`, a per-instrument lock replaces the global dispatch lock. Commands targeting different instruments run concurrently. Commands on the same instrument remain serialized. Non-instrument commands (PING, KSET, etc.) run lock-free. IADD/IREMOVE use a separate registry lock.
+Commands are dispatched serially. Transport concurrency is handled at a lower level: each `Instrument` carries an `asyncio.Lock` acquired inside `_call_driver()` before every driver call. This means background tasks (health pings, watch guards) and foreground commands (IREAD, IWRITE) can coexist on the same instrument without transport collisions. `IMREAD` uses `asyncio.gather` to read all requested resources concurrently — per-instrument serialization is provided automatically by each instrument's lock.
 
 ### Project Structure
 
@@ -268,8 +268,9 @@ testcore/
 ├── protocol.py          # RESP2 parser/serializer
 ├── store.py             # Key-value store with reserved prefixes
 ├── instruments.py       # Instrument registry, state machine
-├── commands.py          # Command dispatch table, all 48 handlers
+├── commands.py          # Command dispatch table, all 52 handlers
 ├── health.py            # HealthMonitor singleton, per-instrument ping tasks
+├── watch.py             # WatchManager singleton, guard tasks (IWATCH/IUNWATCH/IWATCHES)
 ├── events.py            # EventBus pub/sub, event publishing helpers
 ├── journal.py           # Command journal ring buffer
 ├── base_driver.py       # BaseDriver ABC, ScpiDriver base, DriverError
@@ -287,7 +288,7 @@ cli/                     # Windows C CLI client
 ├── build.bat            # MinGW build script
 └── linenoise/           # Line editing library (BSD-2-Clause)
 
-tests/                   # 656 tests, 23 files, pytest
+tests/                   # 690 tests, 25 files, pytest
 ```
 
 ---
@@ -393,7 +394,7 @@ Hardware is never left in an undefined state after a client crash.
 
 ---
 
-## Command Reference (48 commands)
+## Command Reference (52 commands)
 
 ### Command Naming
 
@@ -686,30 +687,115 @@ When an instrument is unlocked (`IUNLOCK`), all its MEAS entries are marked `STA
 results = tc.imread("pm1 POWER", "pm2 POWER", "sa ACPR", "vsg CH1:FREQ", meas=True)
 
 # Later, retrieve stored results (from any client)
-tc.mgetall("pm1")    # {"pm1:POWER": {"value": "-42.3", "ts": 1706140800.1, "status": "OK"}}
+tc.mgetall("pm1")    # {"pm1 POWER": {"value": "-42.3", "ts": 1706140800.1, "status": "OK"}}
 ```
 
 **Post-test verification** — After a test run, `MGETALL` returns every measurement taken with its timestamp and status. A validation script can check that no readings are `STALE` or `ERROR` before accepting the results.
 
-#### MGET instrument:resource
-Returns a single MEAS entry as JSON. Format is `instrument:resource` (colon-separated, matching `MKEYS` output).
+#### MGET instrument resource
+Returns a single MEAS entry as JSON. Same `instrument resource` addressing as `IREAD`.
 ```
-MGET pm1:POWER    →  {"value": "-42.3", "ts": 1706140800.123, "status": "OK"}
+MGET pm1 POWER    →  {"value": "-42.3", "ts": 1706140800.123, "status": "OK"}
 ```
 
 #### MGETALL [instrument]
-Returns all MEAS entries as flat array `[key1, json1, key2, json2, ...]`. Optional instrument filter.
+Returns all MEAS entries as flat array `[key1, json1, key2, json2, ...]`. Keys use `instrument resource` format. Optional instrument filter.
 ```
-MGETALL              →  ["pm1:POWER", "{...}", "sa:ACPR", "{...}"]
-MGETALL pm1          →  ["pm1:POWER", "{...}"]
+MGETALL              →  ["pm1 POWER", "{...}", "sa ACPR", "{...}"]
+MGETALL pm1          →  ["pm1 POWER", "{...}"]
 ```
 
 #### MKEYS [instrument]
-Returns MEAS key names. Optional instrument filter.
+Returns MEAS key names in `instrument resource` format. Optional instrument filter.
 ```
-MKEYS                →  ["pm1:POWER", "pm2:POWER", "sa:ACPR", "vsg:CH1:FREQ"]
-MKEYS pm1            →  ["pm1:POWER"]
+MKEYS                →  ["pm1 POWER", "pm2 POWER", "sa ACPR", "vsg CH1:FREQ"]
+MKEYS pm1            →  ["pm1 POWER"]
 ```
+
+### Watch Guard Commands
+
+The watch guard system registers background tasks that read hardware resources at a fixed interval and apply safety thresholds. If a reading falls outside the specified range, the server immediately calls `safe_state()` on the instrument, transitions it to `FAULT`, and marks the MEAS entry `GUARD_FAULT`. No client action required — the guard runs as long as the instrument is `READY`.
+
+Watch guards complement MEAS: instead of the client polling and reacting, the server monitors and acts automatically.
+
+#### IWATCH name resource interval_ms [MIN=val] [MAX=val]
+Registers a background guard on `instrument:resource`. Polls every `interval_ms` milliseconds (minimum 100 ms). Optional `MIN` and `MAX` thresholds trigger safe_state on violation. **Requires lock + READY.**
+
+Registering a watch on an already-watched resource replaces the previous watch.
+```
+IWATCH psu VOLTAGE 500 MIN=3.0 MAX=3.6    →  +OK   (guard with thresholds)
+IWATCH psu CURRENT 200                     →  +OK   (polling only, no thresholds)
+```
+
+Each poll:
+1. Reads the resource via `_call_driver()` (serialized by instrument lock)
+2. Stores the result as a MEAS entry (`OK` status)
+3. Checks thresholds — if violated: `safe_state()` → `FAULT` → MEAS `GUARD_FAULT`
+
+#### IUNWATCH name resource | name ALL | ALL
+Stops one or more watch guards. The stopped resource's MEAS entry is marked `STALE`.
+```
+IUNWATCH psu VOLTAGE     →  +OK   (stop one resource)
+IUNWATCH psu ALL         →  +OK   (stop all watches on psu)
+IUNWATCH ALL             →  +OK   (stop all watches on all instruments this session owns)
+```
+
+#### IWATCHES [instrument]
+Lists registered watches. Without argument, returns all. With instrument name, filters to that instrument.
+```
+IWATCHES          →  ["psu:VOLTAGE 500ms MIN=3.0 MAX=3.6", "psu:CURRENT 200ms"]
+IWATCHES psu      →  ["psu:VOLTAGE 500ms MIN=3.0 MAX=3.6", "psu:CURRENT 200ms"]
+```
+
+#### Watch lifecycle
+- **IUNLOCK** — stops all watches on the instrument before releasing the lock
+- **IREMOVE** — stops all watches before disconnecting the driver
+- **IRESET** — restores `READY` state; if a watch was registered before the fault, polling resumes automatically
+- **Client disconnect** — IUNLOCK cascade stops all watches for all instruments owned by the session
+
+### Bench Introspection
+
+#### BENCH
+Returns an operational snapshot of all registered instruments. One entry per instrument with state, owner, active watch count, and health configuration. No arguments.
+
+```
+BENCH  →  "awg READY owner=1 watches=1 health=10s"
+          "psu IDLE owner=- watches=0 health=10s"
+          "dmm FAULT owner=1 watches=0 health=off"
+          "sim IDLE owner=- watches=0 health=off"
+```
+
+Useful from the CLI for a quick bench overview without parsing `DUMP` or iterating `IINFO` per instrument.
+
+---
+
+## Bench Configuration File
+
+The `--bench` flag loads a configuration file that pre-populates the instrument registry at server startup. This eliminates the need for every client script to repeat the `IADD` bootstrap sequence.
+
+```bash
+python -m testcore --bench bench.cfg
+```
+
+### File format
+
+One instrument per line, using the same syntax as `IADD`:
+
+```
+# bench.cfg
+# name  driver              address                              [key=value ...]
+awg     agilent33500        TCPIP0::192.168.1.10::inst0::INSTR  health=10
+psu     keysight_e36xx      TCPIP::192.168.1.20::5025            health=30
+dmm     keithley2400        COM3                                 baudrate=115200
+sim     dryrun
+```
+
+- Lines starting with `#` are comments
+- Blank lines are ignored
+- A line with fewer than 2 tokens (name + driver) is skipped with a warning
+- A failed `IADD` (driver not found, connection error) logs a warning and skips that instrument — other lines continue loading
+
+Instruments are registered as `IDLE` with no owner. Lock and initialization remain the responsibility of clients, as always.
 
 ---
 
@@ -752,7 +838,7 @@ Command-line arguments:
 | `driver_timeout` | `5.0`       | `--driver-timeout` | Watchdog timeout for driver calls (s)   |
 | `journal_size`   | `1000`      | `--journal-size`  | Ring buffer entries                      |
 | `max_clients`    | `64`        | `--max-clients`   | Maximum simultaneous connections         |
-| `parallel`       | `false`     | `--parallel`      | Per-instrument locking (see Concurrency Model) |
+| `bench`          | *(none)*    | `--bench`         | Bench config file (see Bench Configuration File) |
 | `loglevel`       | `info`      | `--loglevel`      | Logging verbosity                        |
 
 ### Reliability
@@ -847,7 +933,7 @@ Every driver method call is wrapped in `asyncio.to_thread()` + `asyncio.wait_for
 ## Running Tests
 
 ```bash
-python -m pytest tests/ -v          # 656 tests
+python -m pytest tests/ -v          # 690 tests
 python -m pytest tests/ --tb=short  # compact output
 python -m pytest tests/ -k "monitor"  # filter by name
 ```

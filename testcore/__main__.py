@@ -34,6 +34,7 @@ Examples:
   python -m testcore --port 6400               # Custom port
   python -m testcore --bind 0.0.0.0 --port 6399  # Listen on all interfaces
   python -m testcore --loglevel debug          # Enable debug logging
+  python -m testcore --bench bench.cfg         # Load instruments at startup
 """
     )
 
@@ -72,11 +73,10 @@ Examples:
     )
 
     parser.add_argument(
-        '--parallel',
-        action='store_true',
-        default=False,
-        help='Per-instrument locking: commands on different instruments '
-             'run concurrently (default: global serial dispatch)'
+        '--bench',
+        metavar='FILE',
+        default=None,
+        help='Bench config file: load instruments at startup (default: none)'
     )
 
     parser.add_argument(
@@ -109,14 +109,9 @@ def main():
     get_journal(maxlen=args.journal_size)
     logger.info(f"Journal size: {args.journal_size}")
 
-    # Configure dispatch mode
-    if args.parallel:
-        from .commands import dispatcher
-        dispatcher.set_parallel(True)
-        logger.info("Dispatch mode: parallel (per-instrument locking)")
-
     try:
-        asyncio.run(run_server(args.bind, args.port, args.max_clients))
+        asyncio.run(run_server(args.bind, args.port, args.max_clients,
+                               bench_file=args.bench))
     except KeyboardInterrupt:
         print("\nShutdown complete")
 

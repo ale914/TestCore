@@ -195,7 +195,10 @@ class KeyValueStore:
         for key, meas in self._meas.items():
             if inst_prefix and not key.startswith(inst_prefix):
                 continue
-            result.append((key[len(prefix):], meas))
+            # Display key: "_meas:inst:res" → "inst res"
+            raw = key[len(prefix):]
+            inst, res = raw.split(":", 1)
+            result.append((f"{inst} {res}", meas))
         return result
 
     def get_meas_keys(self, instrument: str | None = None) -> list[str]:
@@ -206,7 +209,9 @@ class KeyValueStore:
         for key in self._meas:
             if inst_prefix and not key.startswith(inst_prefix):
                 continue
-            result.append(key[len(prefix):])
+            raw = key[len(prefix):]
+            inst, res = raw.split(":", 1)
+            result.append(f"{inst} {res}")
         return result
 
 

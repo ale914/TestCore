@@ -162,6 +162,8 @@ class ClientHandler:
                 inst = registry.get(name)
                 if inst.lock_owner == self.client_id:
                     try:
+                        from .watch import get_watch_manager
+                        get_watch_manager().stop_instrument(name)
                         registry.unlock(name, self.client_id)
                         # Invalidate MEAS for this instrument
                         invalidated = store.invalidate_meas(name)
@@ -330,6 +332,10 @@ class TestCoreServer:
         if self.clients:
             await asyncio.gather(*self.clients.values(), return_exceptions=True)
 
+        # Stop watch guard tasks
+        from .watch import get_watch_manager
+        get_watch_manager().stop_all()
+
         # Stop health monitoring tasks
         from .health import get_health_monitor
         get_health_monitor().stop_all()
@@ -362,10 +368,54 @@ class TestCoreServer:
         logger.info("TestCore server stopped")
 
 
+async def load_bench_config(path: str) -> None:
+    """Load bench.cfg and register instruments via IADD.
+
+    Each non-comment, non-blank line is treated as IADD arguments:
+        name driver [address] [key=value ...]
+
+    Failures are logged and skipped — a bad line does not abort startup.
+    Uses session_id=0 (server bootstrap context).
+    """
+    import os
+    from .commands import handle_instrument_add
+
+    ctx = {"session_id": 0}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError as e:
+        logger.error(f"bench.cfg: cannot open '{path}': {e}")
+        return
+
+    loaded = 0
+    for lineno, raw in enumerate(lines, 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) < 2:
+            logger.warning(f"bench.cfg:{lineno}: skipped (need at least name driver): {line!r}")
+            continue
+        try:
+            resp = await handle_instrument_add(parts, ctx)
+            if resp == b"+OK\r\n":
+                logger.info(f"bench.cfg:{lineno}: added {parts[0]}")
+                loaded += 1
+            else:
+                logger.warning(f"bench.cfg:{lineno}: IADD {parts[0]} failed: {resp!r}")
+        except Exception as e:
+            logger.error(f"bench.cfg:{lineno}: IADD {parts[0]} error: {e}")
+
+    logger.info(f"bench.cfg: {loaded} instrument(s) loaded from '{path}'")
+
+
 async def run_server(host: str = "127.0.0.1", port: int = 6399,
-                     max_clients: int = 64):
+                     max_clients: int = 64, bench_file: str | None = None):
     """Run the TestCore server (spec §11: port 6399 to avoid Redis conflicts)."""
     server = TestCoreServer(host, port, max_clients=max_clients)
+    if bench_file:
+        await load_bench_config(bench_file)
     try:
         await server.start()
     except KeyboardInterrupt:

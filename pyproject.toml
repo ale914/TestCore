@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "testcore"
-version = "0.9.3"
+version = "0.9.4"
 description = "Command server for electronic test hardware"
 readme = "README.md"
 requires-python = ">=3.9"

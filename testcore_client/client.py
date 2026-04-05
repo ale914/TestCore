@@ -210,14 +210,15 @@ class TestCore:
     # MEAS commands
     # ------------------------------------------------------------------
 
-    def mget(self, key: str) -> dict | None:
-        """MGET instrument:resource. Returns parsed MEAS dict or None.
+    def mget(self, target: str) -> dict | None:
+        """MGET instrument resource. Returns parsed MEAS dict or None.
 
         Example:
-            tc.mget("sensor1:TEMP")
+            tc.mget("sensor1 TEMP")
             # -> {"value": "72.3", "ts": 1706140800.123, "status": "OK"}
         """
-        r = self._cmd("MGET", key)
+        instrument, resource = target.split(" ", 1)
+        r = self._cmd("MGET", instrument, resource)
         if r is None:
             return None
         return json.loads(r)
@@ -262,7 +263,7 @@ class TestCore:
         r = self._cmd("DUMP")
         return json.loads(r)
 
-    def journal(self, *args: str) -> list[str]:
+    def journal(self, *args: str) -> list[str] | int:
         """JOURNAL [count | +offset [count] | ALL | CLEAR] [REL].
 
         Returns list of formatted journal entries, or int for CLEAR.
@@ -331,9 +332,74 @@ class TestCore:
         """IPING name. Send *IDN? without lock. Returns IDN string."""
         return self._cmd("IPING", name)
 
-    def iwait(self, name: str) -> None:
-        """IWAIT name. Wait for pending operations to complete (*OPC?)."""
-        self._cmd("IWAIT", name)
+    def iwatch(self, target: str, interval_ms: int,
+               min: float | None = None, max: float | None = None) -> bool:
+        """IWATCH instrument resource interval_ms [MIN=val] [MAX=val].
+
+        Register a safety guard that periodically reads the resource.
+        If value violates min/max thresholds, calls safe_state() + FAULT.
+        Requires lock + READY. Returns True.
+
+        Example:
+            tc.iwatch("psu CH1:VOLTAGE", 1000, min=3.2, max=3.4)
+            tc.iwatch("sensor1 TEMP", 500, max=85)
+        """
+        instrument, resource = target.split(" ", 1)
+        args = ["IWATCH", instrument, resource, str(interval_ms)]
+        if min is not None:
+            args.append(f"MIN={min}")
+        if max is not None:
+            args.append(f"MAX={max}")
+        r = self._cmd(*args)
+        return r == "OK"
+
+    def iunwatch(self, *args: str) -> bool:
+        """IUNWATCH name resource | name ALL | ALL. Returns True.
+
+        Example:
+            tc.iunwatch("psu", "VOLTAGE")   # stop specific guard
+            tc.iunwatch("psu", "ALL")       # stop all guards on psu
+            tc.iunwatch("ALL")              # stop all guards this session owns
+        """
+        r = self._cmd("IUNWATCH", *args)
+        return r == "OK"
+
+    def iwatches(self, instrument: str | None = None) -> list[str]:
+        """IWATCHES [instrument]. List active guards."""
+        args = ["IWATCHES"]
+        if instrument:
+            args.append(instrument)
+        r = self._cmd(*args)
+        if r is None:
+            return []
+        if isinstance(r, str):
+            return [r]
+        return r
+
+    def bench(self) -> list[dict]:
+        """BENCH. Returns operational view of all instruments.
+
+        Each dict has keys: name, state, owner, watches, health.
+
+        Example:
+            tc.bench()
+            # -> [{"name": "awg", "state": "READY", "owner": "1",
+            #       "watches": "0", "health": "10s"}, ...]
+        """
+        r = self._cmd("BENCH")
+        if not r:
+            return []
+        if isinstance(r, str):
+            r = [r]
+        result = []
+        for entry in r:
+            parts = entry.split()
+            d = {"name": parts[0], "state": parts[1]}
+            for p in parts[2:]:
+                k, v = p.split("=", 1)
+                d[k] = v
+            result.append(d)
+        return result
 
     def driver_list(self) -> list[str]:
         """DRIVER LIST. Returns list of loaded drivers."""
@@ -750,6 +816,23 @@ class Pipeline:
     def ilist(self) -> Pipeline:
         return self._queue(self._parse_list, "ILIST")
 
+    def bench(self) -> Pipeline:
+        def parse(r):
+            if not r:
+                return []
+            if isinstance(r, str):
+                r = [r]
+            result = []
+            for entry in r:
+                parts = entry.split()
+                d = {"name": parts[0], "state": parts[1]}
+                for p in parts[2:]:
+                    k, v = p.split("=", 1)
+                    d[k] = v
+                result.append(d)
+            return result
+        return self._queue(parse, "BENCH")
+
     def ilock(self, *instruments: str) -> Pipeline:
         return self._queue(self._parse_ok, "ILOCK", *instruments)
 
@@ -805,18 +888,38 @@ class Pipeline:
     def iwait(self, name: str) -> Pipeline:
         return self._queue(self._parse_ok, "IWAIT", name)
 
+    def iwatch(self, target: str, interval_ms: int,
+               min: float | None = None, max: float | None = None) -> Pipeline:
+        instrument, resource = target.split(" ", 1)
+        args = ["IWATCH", instrument, resource, str(interval_ms)]
+        if min is not None:
+            args.append(f"MIN={min}")
+        if max is not None:
+            args.append(f"MAX={max}")
+        return self._queue(self._parse_ok, *args)
+
+    def iunwatch(self, *args: str) -> Pipeline:
+        return self._queue(self._parse_ok, "IUNWATCH", *args)
+
+    def iwatches(self, instrument: str | None = None) -> Pipeline:
+        args = ["IWATCHES"]
+        if instrument:
+            args.append(instrument)
+        return self._queue(self._parse_list, *args)
+
     def ialign(self, *names: str) -> Pipeline:
         return self._queue(self._parse_ok, "IALIGN", *names)
 
     # -- MEAS commands ---
 
-    def mget(self, key: str) -> Pipeline:
-        """MGET instrument:resource."""
+    def mget(self, target: str) -> Pipeline:
+        """MGET instrument resource."""
+        instrument, resource = target.split(" ", 1)
         def parse(r):
             if r is None:
                 return None
             return json.loads(r)
-        return self._queue(parse, "MGET", key)
+        return self._queue(parse, "MGET", instrument, resource)
 
     def mgetall(self, instrument: str | None = None) -> Pipeline:
         args = ["MGETALL"]

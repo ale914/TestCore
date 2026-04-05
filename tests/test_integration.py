@@ -1738,7 +1738,7 @@ class TestMEAS:
             assert isinstance(value, str)  # dryrun returns a value
 
             # MGET retrieves the MEAS
-            await c.send(["MGET", "sim:VOUT"])
+            await c.send(["MGET", "sim", "VOUT"])
             resp = await c.read()
             import json
             meas = json.loads(resp)
@@ -1758,7 +1758,7 @@ class TestMEAS:
             await c.send(["IREAD", "sim", "VOUT"])
             await c.read()
 
-            await c.send(["MGET", "sim:VOUT"])
+            await c.send(["MGET", "sim", "VOUT"])
             resp = await c.read()
             assert resp is None  # nil
         finally:
@@ -1769,7 +1769,7 @@ class TestMEAS:
         """MGET for a non-existent MEAS returns nil."""
         c = await Client.connect(server.test_port)
         try:
-            await c.send(["MGET", "nosuch:RES"])
+            await c.send(["MGET", "nosuch", "RES"])
             resp = await c.read()
             assert resp is None
         finally:
@@ -1793,8 +1793,8 @@ class TestMEAS:
             keys = await c.read()
             assert isinstance(keys, list)
             assert len(keys) == 2
-            assert "sim:VOUT" in keys
-            assert "sim:FREQ" in keys
+            assert "sim VOUT" in keys
+            assert "sim FREQ" in keys
 
             # MGETALL
             await c.send(["MGETALL"])
@@ -1831,7 +1831,7 @@ class TestMEAS:
             await c.send(["MGETALL", "sim1"])
             resp = await c.read()
             assert len(resp) == 2  # one key-value pair
-            assert resp[0] == "sim1:VOUT"
+            assert resp[0] == "sim1 VOUT"
         finally:
             await c.close()
 
@@ -1848,7 +1848,7 @@ class TestMEAS:
             value = await a.read()
 
             # Non-owner reads MEAS
-            await b.send(["MGET", "sim:VOUT"])
+            await b.send(["MGET", "sim", "VOUT"])
             resp = await b.read()
             import json
             meas = json.loads(resp)
@@ -1885,7 +1885,7 @@ class TestMEAS:
             assert await c.read() == "OK"
 
             # MGET returns STALE with last value
-            await c.send(["MGET", "sim:VOUT"])
+            await c.send(["MGET", "sim", "VOUT"])
             resp = await c.read()
             import json
             meas = json.loads(resp)
@@ -1911,11 +1911,11 @@ class TestMEAS:
             assert await c.read() == "OK"
 
             import json
-            await c.send(["MGET", "sim1:VOUT"])
+            await c.send(["MGET", "sim1", "VOUT"])
             m1 = json.loads(await c.read())
             assert m1["status"] == "STALE"
 
-            await c.send(["MGET", "sim2:VOUT"])
+            await c.send(["MGET", "sim2", "VOUT"])
             m2 = json.loads(await c.read())
             assert m2["status"] == "STALE"
         finally:
@@ -1937,7 +1937,7 @@ class TestMEAS:
             await asyncio.sleep(0.15)
 
             # MEAS should be STALE
-            await b.send(["MGET", "sim:VOUT"])
+            await b.send(["MGET", "sim", "VOUT"])
             resp = await b.read()
             import json
             meas = json.loads(resp)
@@ -1974,7 +1974,7 @@ class TestMEAS:
             new_value = await b.read()
 
             # MEAS should be OK with new value
-            await b.send(["MGET", "sim:VOUT"])
+            await b.send(["MGET", "sim", "VOUT"])
             resp = await b.read()
             import json
             meas = json.loads(resp)
@@ -1995,7 +1995,7 @@ class TestMEAS:
             value = await c.read()
             assert isinstance(value, str)
 
-            await c.send(["MGET", "sim:VOUT"])
+            await c.send(["MGET", "sim", "VOUT"])
             resp = await c.read()
             import json
             meas = json.loads(resp)

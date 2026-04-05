@@ -2,17 +2,15 @@
 # Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0)
 # See LICENSE file for details.
 
-"""Tests for --parallel per-instrument dispatch locking."""
+"""Tests for IMREAD parallel dispatch behavior."""
 
 import asyncio
-import time
 import pytest
 from testcore.commands import dispatcher, handle_instrument_add
 from testcore.instruments import get_registry, InstrumentState
 
 DRYRUN_PATH = "dryrun"
 SESSION_1 = 1
-SESSION_2 = 2
 
 
 @pytest.fixture(autouse=True)
@@ -27,165 +25,112 @@ def reset_all():
     registry._instruments.clear()
     registry._driver_modules.clear()
 
-    # Reset dispatcher parallel state
-    dispatcher._parallel = False
-    dispatcher._instrument_locks.clear()
     dispatcher._dispatch_lock = None
-    dispatcher._registry_lock = None
 
     from testcore.health import get_health_monitor
     get_health_monitor().stop_all()
 
-
-class TestParallelFlag:
-    """Tests for set_parallel() configuration."""
-
-    def test_default_not_parallel(self):
-        assert dispatcher._parallel is False
-
-    def test_set_parallel(self):
-        dispatcher.set_parallel(True)
-        assert dispatcher._parallel is True
-
-    def test_set_parallel_false(self):
-        dispatcher.set_parallel(True)
-        dispatcher.set_parallel(False)
-        assert dispatcher._parallel is False
+    from testcore.watch import get_watch_manager
+    get_watch_manager().stop_all()
+    get_watch_manager()._watches.clear()
 
 
-class TestParallelExtractInstruments:
-    """Tests for _extract_instruments() instrument name extraction."""
-
-    def test_single_instrument_command(self):
-        result = dispatcher._extract_instruments("IREAD", ["awg", "CH1:FREQ"])
-        assert result == ["awg"]
-
-    def test_single_instrument_colon_format(self):
-        result = dispatcher._extract_instruments("IREAD", ["awg:CH1:FREQ"])
-        assert result == ["awg"]
-
-    def test_multi_instrument_command(self):
-        result = dispatcher._extract_instruments("ILOCK", ["awg", "osc1", "osc2"])
-        assert result == ["awg", "osc1", "osc2"]
-
-    def test_imread_multi(self):
-        result = dispatcher._extract_instruments(
-            "IMREAD", ["awg:CH1:FREQ", "osc:CH1:AMPL"])
-        assert set(result) == {"awg", "osc"}
-
-    def test_non_instrument_command(self):
-        result = dispatcher._extract_instruments("PING", [])
-        assert result == []
-
-    def test_kset_no_lock(self):
-        result = dispatcher._extract_instruments("KSET", ["key", "value"])
-        assert result == []
-
-    def test_unlock_all(self):
-        result = dispatcher._extract_instruments("IUNLOCK", ["ALL"])
-        assert result == []
-
-    def test_unlock_single(self):
-        result = dispatcher._extract_instruments("IUNLOCK", ["awg"])
-        assert result == ["awg"]
-
-    def test_empty_args(self):
-        result = dispatcher._extract_instruments("IREAD", [])
-        assert result == []
-
-    def test_registry_command_not_extracted(self):
-        """IADD/IREMOVE use registry lock, not instrument lock."""
-        result = dispatcher._extract_instruments("IADD", ["awg", "dryrun"])
-        assert result == []
+async def _setup_ready(name):
+    ctx = {"session_id": SESSION_1}
+    await dispatcher.dispatch(["IADD", name, DRYRUN_PATH], ctx)
+    await dispatcher.dispatch(["ILOCK", name], ctx)
+    await dispatcher.dispatch(["IINIT", name], ctx)
 
 
-class TestParallelDispatch:
-    """Tests for parallel dispatch behavior."""
+class TestSerialDispatch:
+    """Dispatcher uses a single global asyncio.Lock by default."""
 
     @pytest.mark.asyncio
-    async def test_non_instrument_no_lock(self):
-        """Non-instrument commands run without any lock in parallel mode."""
-        dispatcher.set_parallel(True)
+    async def test_ping_works(self):
         response = await dispatcher.dispatch(["PING"], {})
         assert response == b'+PONG\r\n'
 
     @pytest.mark.asyncio
-    async def test_kset_no_lock(self):
-        """KV commands run without lock in parallel mode."""
-        dispatcher.set_parallel(True)
+    async def test_dispatch_lock_created_on_first_call(self):
+        """Dispatch lock is lazily created on first dispatch."""
+        dispatcher._dispatch_lock = None
+        await dispatcher.dispatch(["PING"], {})
+        assert dispatcher._dispatch_lock is not None
+
+    @pytest.mark.asyncio
+    async def test_kset_runs_serially(self):
         response = await dispatcher.dispatch(
             ["KSET", "key", "val"], {"session_id": 1})
         assert response == b'+OK\r\n'
 
     @pytest.mark.asyncio
-    async def test_iadd_uses_registry_lock(self):
-        """IADD acquires registry lock in parallel mode."""
-        dispatcher.set_parallel(True)
+    async def test_iadd_works(self):
         response = await dispatcher.dispatch(
-            ["IADD", "vsg", DRYRUN_PATH], {})
+            ["IADD", "vsg", DRYRUN_PATH], {"session_id": SESSION_1})
         assert response == b'+OK\r\n'
         assert "vsg" in get_registry()._instruments
 
-    @pytest.mark.asyncio
-    async def test_iremove_cleans_lock(self):
-        """IREMOVE removes the per-instrument lock."""
-        dispatcher.set_parallel(True)
-        await dispatcher.dispatch(["IADD", "vsg", DRYRUN_PATH], {})
 
-        # Create instrument lock by dispatching an instrument command
-        await dispatcher.dispatch(["IINFO", "vsg"], {})
-        assert "vsg" in dispatcher._instrument_locks
-
-        await dispatcher.dispatch(["IREMOVE", "vsg"], {})
-        assert "vsg" not in dispatcher._instrument_locks
+class TestIReadParallel:
+    """IMREAD always reads all resources concurrently via asyncio.gather."""
 
     @pytest.mark.asyncio
-    async def test_instrument_command_creates_lock(self):
-        """First instrument command creates a per-instrument lock."""
-        dispatcher.set_parallel(True)
-        await dispatcher.dispatch(["IADD", "vsg", DRYRUN_PATH], {})
-
-        assert "vsg" not in dispatcher._instrument_locks
-        await dispatcher.dispatch(["IPING", "vsg"], {})
-        assert "vsg" in dispatcher._instrument_locks
-
-    @pytest.mark.asyncio
-    async def test_parallel_different_instruments(self):
-        """Commands on different instruments can run concurrently."""
-        dispatcher.set_parallel(True)
-        await dispatcher.dispatch(["IADD", "inst1", DRYRUN_PATH], {})
-        await dispatcher.dispatch(["IADD", "inst2", DRYRUN_PATH], {})
-
-        # Both should complete without blocking each other
+    async def test_imread_single(self):
+        """IMREAD with one target works."""
+        await _setup_ready("inst1")
         ctx = {"session_id": SESSION_1}
-        await dispatcher.dispatch(["ILOCK", "inst1"], ctx)
-        await dispatcher.dispatch(["ILOCK", "inst2"], ctx)
-
-        r1 = await dispatcher.dispatch(["IPING", "inst1"], ctx)
-        r2 = await dispatcher.dispatch(["IPING", "inst2"], ctx)
-        assert not r1.startswith(b'-')
-        assert not r2.startswith(b'-')
+        r = await dispatcher.dispatch(["IMREAD", "inst1:VOUT"], ctx)
+        assert not r.startswith(b'-')
 
     @pytest.mark.asyncio
-    async def test_global_mode_still_works(self):
-        """Default (non-parallel) mode uses global lock."""
-        # dispatcher._parallel is False by default from fixture
-        response = await dispatcher.dispatch(["PING"], {})
-        assert response == b'+PONG\r\n'
-        assert dispatcher._dispatch_lock is not None
-
-    @pytest.mark.asyncio
-    async def test_ilock_multi_sorted_order(self):
-        """ILOCK with multiple instruments acquires locks in sorted order."""
-        dispatcher.set_parallel(True)
-        await dispatcher.dispatch(["IADD", "zzz", DRYRUN_PATH], {})
-        await dispatcher.dispatch(["IADD", "aaa", DRYRUN_PATH], {})
-
+    async def test_imread_multiple_same_instrument(self):
+        """IMREAD with multiple resources on one instrument works."""
+        await _setup_ready("inst1")
         ctx = {"session_id": SESSION_1}
-        response = await dispatcher.dispatch(["ILOCK", "zzz", "aaa"], ctx)
-        assert response == b'+OK\r\n'
+        r = await dispatcher.dispatch(["IMREAD", "inst1:VOUT", "inst1:FREQ"], ctx)
+        assert not r.startswith(b'-')
+        # Returns RESP array
+        assert r.startswith(b'*')
 
-        # Both should be locked
-        registry = get_registry()
-        assert registry.get("zzz").lock_owner == SESSION_1
-        assert registry.get("aaa").lock_owner == SESSION_1
+    @pytest.mark.asyncio
+    async def test_imread_multiple_instruments(self):
+        """IMREAD on different instruments executes concurrently."""
+        await _setup_ready("inst1")
+        await _setup_ready("inst2")
+        ctx = {"session_id": SESSION_1}
+        r = await dispatcher.dispatch(
+            ["IMREAD", "inst1:VOUT", "inst2:VOUT"], ctx)
+        assert not r.startswith(b'-')
+        assert r.startswith(b'*')
+
+    @pytest.mark.asyncio
+    async def test_imread_returns_array(self):
+        """IMREAD returns RESP array with one element per resource."""
+        await _setup_ready("inst1")
+        ctx = {"session_id": SESSION_1}
+        r = await dispatcher.dispatch(
+            ["IMREAD", "inst1:VOUT", "inst1:FREQ"], ctx)
+        # *2\r\n... — array of 2 elements
+        assert r.startswith(b'*2\r\n')
+
+    @pytest.mark.asyncio
+    async def test_imread_requires_lock(self):
+        """IMREAD returns error if caller doesn't hold the lock."""
+        await _setup_ready("inst1")
+        other_ctx = {"session_id": 99}
+        r = await dispatcher.dispatch(["IMREAD", "inst1:VOUT"], other_ctx)
+        assert r.startswith(b'-')
+
+    @pytest.mark.asyncio
+    async def test_imread_unknown_instrument(self):
+        """IMREAD returns error for unknown instrument."""
+        ctx = {"session_id": SESSION_1}
+        r = await dispatcher.dispatch(["IMREAD", "noexist:VOUT"], ctx)
+        assert r.startswith(b'-')
+
+    @pytest.mark.asyncio
+    async def test_imread_no_args_error(self):
+        """IMREAD with no args returns error."""
+        ctx = {"session_id": SESSION_1}
+        r = await dispatcher.dispatch(["IMREAD"], ctx)
+        assert r.startswith(b'-')
